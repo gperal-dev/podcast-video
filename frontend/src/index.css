@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+:root {
+  --accent: #4f46e5;
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+}
+
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 3px solid #4f46e5;
+  outline-offset: 2px;
+}
+
+input[type="checkbox"],
+input[type="radio"],
+input[type="range"] {
+  accent-color: #4f46e5;
+}
+
+/* Native <dialog> modal scroll containment per modern-web-guidance */
+dialog:modal {
+  overscroll-behavior: contain;
+  margin: auto;
+  border: none;
+  padding: 0;
+  background: transparent;
+  max-width: min(96vw, 64rem);
+  max-height: 92vh;
+}
+
+dialog::backdrop {
+  background: rgb(15 23 42 / 0.72);
+  backdrop-filter: blur(4px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+/* Accessible single-row tablist indicator without layout shift */
+[role="tablist"] {
+  display: flex;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+[role="tablist"]::-webkit-scrollbar {
+  display: none;
+}
+
+[role="tab"] {
+  position: relative;
+  flex: none;
+}
+
+[role="tab"][aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0;
+  border-block-end: 3px solid var(--accent);
+}

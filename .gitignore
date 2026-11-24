@@ -1,0 +1,38 @@
+# Secrets & local environment
+.env
+.env.*
+!.env.example
+
+# Python environments & caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Frontend dependencies & build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Runtime media, processing checkpoints & analytics exports
+input/
+output/
+processing/
+cache/
+analytics_studio/data/
+
+# Binary media & temp files
+*.mp3
+*.mp4
+*.wav
+*.m4a
+*.flac
+*.aac
+*.ogg
+*.mkv
+*.tmp
+.DS_Store
+Thumbs.db

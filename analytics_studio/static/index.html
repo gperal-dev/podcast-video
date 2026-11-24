@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PodcastForge Studio — Panel Editorial y Rendimiento</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" defer></script>
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-brand">
+        <div class="brand-mark" aria-hidden="true">PF</div>
+        <div>
+          <h1>PodcastForge Studio · Panel de Análisis</h1>
+          <p class="subtitle">Inspector visual de cortes, línea de tiempo del podcast y métricas de producción</p>
+        </div>
+      </div>
+
+      <div class="topbar-controls">
+        <label class="job-picker-label" for="job-select">
+          <span>Prueba / Episodio:</span>
+          <select id="job-select"></select>
+        </label>
+        <button type="button" id="refresh-btn" class="btn btn-secondary">Actualizar</button>
+      </div>
+    </header>
+
+    <div class="tabs-bar-wrap">
+      <div class="tablist" role="tablist" aria-label="Vistas principales">
+        <button type="button" role="tab" id="tab-run" aria-selected="true">
+          Análisis de esta Prueba
+        </button>
+        <button type="button" role="tab" id="tab-compare" aria-selected="false">
+          Comparativa General (Todas las Pruebas)
+        </button>
+      </div>
+    </div>
+
+    <main class="container">
+      <!-- TAB 1: SINGLE RUN DEEP VISUAL STUDIO -->
+      <section role="tabpanel" id="panel-run" aria-labelledby="tab-run" tabindex="0">
+        <div class="panel-inner space-y-lg">
+          <!-- 1. INFORMACIÓN BÁSICA DEL PROCESO -->
+          <section aria-labelledby="basic-info-title">
+            <div class="section-header">
+              <h2 id="basic-info-title">Información Básica del Proceso</h2>
+              <span id="job-status-pill" class="pill">--</span>
+            </div>
+            <div class="kpi-grid" id="kpi-grid"></div>
+          </section>
+
+          <!-- 2. LÍNEA DEL TIEMPO GRANDE Y VISUAL DEL PODCAST + VÍDEOS -->
+          <section class="card card-elevated" aria-labelledby="timeline-title">
+            <div class="card-head wrap">
+              <div>
+                <h2 id="timeline-title">Línea de Tiempo del Podcast Original y Vídeos Generados</h2>
+                <p class="muted" id="audio-status-line">Cargando audio original...</p>
+              </div>
+              <div class="master-transport">
+                <button type="button" id="master-play-btn" class="btn btn-primary">
+                  Reproducir Podcast Completo
+                </button>
+                <span class="clock-badge" id="audio-clock">00:00 / 00:00</span>
+              </div>
+            </div>
+
+            <audio id="source-audio" controls preload="metadata" class="native-audio"></audio>
+
+            <div class="legend-row" aria-label="Leyenda de colores">
+              <span class="leg"><i class="sw sw-hook"></i> Gancho Inicial (Cold Open)</span>
+              <span class="leg"><i class="sw sw-intro"></i> Contexto Previo</span>
+              <span class="leg"><i class="sw sw-core"></i> Desarrollo Central</span>
+              <span class="leg"><i class="sw sw-payoff"></i> Desenlace / Remate</span>
+              <span class="leg"><i class="sw sw-excised"></i> Poda / Salto recortado</span>
+              <span class="leg"><i class="sw sw-promo"></i> Promos / Anuncios quitados</span>
+              <span class="leg"><i class="sw sw-music"></i> Música / Silencios</span>
+            </div>
+
+            <div id="daw-ruler" class="daw-ruler" aria-hidden="true"></div>
+            <div id="daw-container" class="daw-shell"></div>
+            <p class="hint-line">
+              Consejo: pulsa <strong>Reproducir Podcast Completo</strong> o haz clic en la regla para escuchar el episodio original; haz clic sobre cualquiera de los <strong>vídeos de color</strong> para abrir abajo su reproductor y ver exactamente dónde están sus cortes y saltos.
+            </p>
+          </section>
+
+          <!-- 3. ESTUDIO VISUAL DE CORTES DEL VÍDEO SELECCIONADO -->
+          <section class="card card-elevated" id="video-studio-section" aria-labelledby="video-studio-title">
+            <div class="card-head wrap">
+              <div>
+                <span class="eyebrow">Estudio Visual de Cortes del Vídeo Generado</span>
+                <h2 id="video-studio-title">Selecciona un vídeo</h2>
+              </div>
+              <div id="clip-pills-bar" class="clip-pills-bar"></div>
+            </div>
+
+            <div class="video-studio-grid">
+              <!-- Left: Generated MP4 Player + Jump Shortcuts -->
+              <div class="video-player-col">
+                <div class="video-frame-wrap">
+                  <video id="clip-video-player" controls preload="metadata"></video>
+                  <p id="clip-video-missing" class="muted" hidden>
+                    El archivo MP4 de esta prueba anterior ya no está en disco.
+                  </p>
+                </div>
+                <div class="jump-strip" id="video-jump-buttons"></div>
+              </div>
+
+              <!-- Right: Final Assembly Bar + Visual Cut-by-Cut Cards -->
+              <div class="video-inspector-col space-y-md">
+                <div>
+                  <div class="row-between">
+                    <h3>Estructura del Vídeo Final (Intro → Tramos → Outro)</h3>
+                    <span id="clip-edl-badge" class="pill pill-blue">--</span>
+                  </div>
+                  <div id="clip-assembly-bar" class="assembly-bar-lg"></div>
+                  <div id="clip-edl-stats" class="mini-stats"></div>
+                </div>
+
+                <div>
+                  <h3>Saltos y Recortes Dentro del Vídeo</h3>
+                  <p class="muted" style="margin-bottom:0.5rem">
+                    Pulsa en cualquier salto para reproducir el vídeo justo 2 segundos antes del corte y comprobar cómo suena la unión.
+                  </p>
+                  <div id="splices-list" class="splices-list"></div>
+                </div>
+
+                <details class="clean-details">
+                  <summary>Ver guion hablado completo y metadatos del vídeo</summary>
+                  <div class="details-body space-y-sm">
+                    <div id="clip-meta-details" class="meta-stack"></div>
+                    <div id="clip-intro-box" class="callout-light"></div>
+                    <p id="clip-spoken-body" class="spoken-body"></p>
+                  </div>
+                </details>
+
+                <details class="clean-details">
+                  <summary>Ver storyboard visual plano a plano y notas QA</summary>
+                  <div class="details-body space-y-md">
+                    <div id="clip-storyboard-strip" class="storyboard-grid"></div>
+                    <form id="qa-note-form" class="note-form">
+                      <div class="tag-checks" id="qa-tag-checks">
+                        <label><input type="checkbox" value="buen_gancho" /><span>Buen gancho</span></label>
+                        <label><input type="checkbox" value="contexto_claro" /><span>Contexto claro</span></label>
+                        <label><input type="checkbox" value="corte_brusco" /><span>Corte brusco</span></label>
+                        <label><input type="checkbox" value="hueco_silencio" /><span>Hueco de silencio</span></label>
+                        <label><input type="checkbox" value="stock_anacronico" /><span>Stock anacrónico</span></label>
+                        <label><input type="checkbox" value="listo_publicar" /><span>Listo para publicar</span></label>
+                      </div>
+                      <label for="qa-note-text" class="sr-only">Notas personales</label>
+                      <textarea id="qa-note-text" rows="2" placeholder="Escribe una nota rápida sobre este vídeo..."></textarea>
+                      <div class="row-between">
+                        <span id="qa-note-status" class="muted"></span>
+                        <button type="submit" class="btn btn-primary btn-sm">Guardar nota QA</button>
+                      </div>
+                    </form>
+                  </div>
+                </details>
+              </div>
+            </div>
+          </section>
+
+          <!-- 4. RENDIMIENTO EXCLUSIVO DE ESTA PRUEBA -->
+          <section class="card" aria-labelledby="perf-title">
+            <div class="card-head wrap">
+              <div>
+                <h2 id="perf-title">Rendimiento de esta Prueba (Fases, Tiempos, Costes y Tokens)</h2>
+                <p class="muted" id="bottleneck-line">Calculando cuello de botella...</p>
+              </div>
+            </div>
+
+            <div id="pipeline-flow-strip" class="pipeline-flow-strip"></div>
+
+            <div class="two-col" style="margin-top:1rem">
+              <div class="subcard">
+                <h3>Tiempo por Fase y Render FFmpeg</h3>
+                <div class="chart-box">
+                  <canvas id="phase-time-chart"></canvas>
+                </div>
+                <div id="clip-render-times" class="mini-stats"></div>
+              </div>
+
+              <div class="subcard">
+                <h3>Reparto de Coste USD y Tokens por Modelo</h3>
+                <div class="chart-box">
+                  <canvas id="model-cost-chart"></canvas>
+                </div>
+                <div id="model-cost-table" class="mini-stats"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 5. RESUMEN VISUAL DEL JUEZ CIEGO Y EDITOR NLE -->
+          <section class="card" aria-labelledby="judge-title">
+            <div class="card-head wrap">
+              <div>
+                <h2 id="judge-title">Qué Hizo el Juez Ciego y el Editor NLE</h2>
+                <p class="muted">Embudo visual de selección, reparaciones, cortinillas IA y motivos de descarte</p>
+              </div>
+              <select id="judge-filter" aria-label="Filtrar candidatos del Juez Ciego">
+                <option value="all">Ver todos los candidatos</option>
+                <option value="approved">Solo seleccionados / rescatados</option>
+                <option value="rejected">Solo descartados</option>
+              </select>
+            </div>
+
+            <div class="two-col">
+              <div class="subcard">
+                <h3>Embudo Visual de Selección</h3>
+                <div id="funnel-visual" class="funnel-visual"></div>
+              </div>
+              <div class="subcard">
+                <h3>Distribución de Decisiones</h3>
+                <div class="chart-box">
+                  <canvas id="judge-funnel-chart"></canvas>
+                </div>
+              </div>
+            </div>
+
+            <div id="judge-cards-list" class="judge-cards-grid" style="margin-top:1rem"></div>
+
+            <details class="clean-details" style="margin-top:1rem">
+              <summary>Ver glosario corregido (Whisper → real) y logs completos de ejecución</summary>
+              <div class="details-body space-y-md">
+                <div id="glossary-chips" class="glossary-chips"></div>
+                <div class="filter-bar">
+                  <input id="log-search" type="search" placeholder="Filtrar logs..." aria-label="Filtrar logs" />
+                  <select id="log-level" aria-label="Nivel de log">
+                    <option value="all">Todos</option>
+                    <option value="warning">Avisos</option>
+                    <option value="error">Errores</option>
+                  </select>
+                </div>
+                <pre id="logs-viewer" class="logs-pre"></pre>
+              </div>
+            </details>
+          </section>
+        </div>
+      </section>
+
+      <!-- TAB 2: GENERAL COMPARISON ACROSS ALL RUNS -->
+      <section role="tabpanel" id="panel-compare" aria-labelledby="tab-compare" hidden>
+        <div class="panel-inner space-y-lg">
+          <section aria-labelledby="global-kpi-title">
+            <div class="section-header">
+              <h2 id="global-kpi-title">Resumen Histórico Global (Todas las Pruebas Guardadas)</h2>
+            </div>
+            <div class="kpi-grid" id="global-kpi-grid"></div>
+          </section>
+
+          <div class="two-col">
+            <section class="card">
+              <h2>Coste (centavos USD) vs. Vídeos Generados</h2>
+              <div class="chart-box chart-box-lg">
+                <canvas id="history-cost-chart"></canvas>
+              </div>
+            </section>
+
+            <section class="card">
+              <h2>Tiempo Total de Proceso por Prueba (minutos)</h2>
+              <div class="chart-box chart-box-lg">
+                <canvas id="history-time-chart"></canvas>
+              </div>
+            </section>
+          </div>
+
+          <section class="card">
+            <h2>Tasa de Éxito del Juez Ciego (Evaluados vs. Descartados)</h2>
+            <div class="chart-box chart-box-lg">
+              <canvas id="history-judge-chart"></canvas>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2 id="hist-table-cap" style="margin-bottom:0.75rem">Listado Comparativo de Todas las Pruebas (pulsa una fila para abrirla)</h2>
+            <div tabindex="0" role="region" aria-labelledby="hist-table-cap" class="table-wrapper">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Episodio / Prueba</th>
+                    <th>Estado</th>
+                    <th>Audio Original</th>
+                    <th>Tiempo Proceso</th>
+                    <th>Vídeos</th>
+                    <th>Juez (Eval / Desc)</th>
+                    <th>Coste USD</th>
+                    <th>Tokens</th>
+                  </tr>
+                </thead>
+                <tbody id="history-tbody"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
