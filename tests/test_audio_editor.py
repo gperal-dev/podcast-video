@@ -412,3 +412,27 @@ def test_trim_pass2_edge_orphans_trims_internal_spans() -> None:
     assert len(trimmed) == 2
     assert trimmed[1][0] >= 10.75
     assert 13.40 <= trimmed[1][1] <= 13.55
+
+
+def test_edl_closes_residual_dead_gap_overlapping_short_vad_gap() -> None:
+    from backend.core.audio_editor import build_edl_for_spans, verify_edl_no_duplicates
+
+    words = [
+        WordTimestamp(word="Primera", start=1.00, end=1.40),
+        WordTimestamp(word="frase.", start=1.45, end=2.00),
+        # 3.4s dead gap where VAD only caught a 0.4s fragment at 3.2..3.6
+        WordTimestamp(word="Segunda", start=5.40, end=5.80),
+        WordTimestamp(word="frase.", start=5.85, end=6.40),
+    ]
+    audio_cfg = AudioEditConfig(remove_silences=True, keep_silence_sec=0.14, min_silence_sec=0.45, crossfade_ms=45)
+    edl, _, mapped = build_edl_for_spans(
+        clip_id="dead_gap_overlap",
+        spans=[(0.95, 6.50)],
+        words=words,
+        silence_intervals=[],
+        audio_config=audio_cfg,
+        non_speech_intervals=[(3.20, 3.60)],
+    )
+    assert verify_edl_no_duplicates(edl, mapped) == []
+    max_gap = max(mapped[i].start - mapped[i - 1].end for i in range(1, len(mapped)))
+    assert max_gap < 0.85

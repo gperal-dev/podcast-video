@@ -199,6 +199,7 @@ def _make_sentences(count: int = 80, step_sec: float = 5.0) -> list[SentenceSegm
 def test_short_podcast_graceful_adjustment_and_selection() -> None:
     # 400s (~6.6 min) podcast while user asks for 12-min long video -> should warn and adapt cleanly
     sents = _make_sentences(count=80, step_sec=5.0)
+    sents[3].text = "Frase número 4 con contenido interesante sobre Estraip, negocios y tecnología."
     profile = PodcasterProfile(id="test", name="Test", podcast_name="Test Show")
     mock_llm = _MockOpenRouter(sents)
 
@@ -1984,4 +1985,883 @@ def test_nle_repair_and_intro_salvages_mid_episode_whisper_clip() -> None:
     )
     assert "croquetas" not in cut_text
     assert "aeronáutica" in cut_text
+
+
+def test_video_outline_coverage_triggers_nle_repair_and_hook_cleanup() -> None:
+    """Missing beat from a clip's own video_outline triggers NLE repair even if Blind Judge liked the initial cut."""
+    from backend.core.editorial_engine import _audit_and_refine_candidate, _clean_trailing_hook_words
+    from backend.models.job import ClipCandidate, NarrativeSpan
+
+    assert _clean_trailing_hook_words("Una arandela salvó al Spitfire de la") == "Una arandela salvó al Spitfire"
+    assert _clean_trailing_hook_words("El secreto de") == "El secreto"
+    assert _clean_trailing_hook_words("Secreto de") == "Secreto de"  # keeps >=2 words
+
+    sents = [
+        SentenceSegment(id="S0001", text="Beatrice Shilling nació en 1909 en Hampshire y le encantaban las motos.", start=0.0, end=8.0, words=[]),
+        SentenceSegment(id="S0002", text="Estudió ingeniería en Manchester cuando pocas mujeres lo hacían.", start=8.2, end=16.0, words=[]),
+        SentenceSegment(id="S0003", text="En 1940 diseñó una arandela clave para el carburador del Spitfire que evitaba que el motor se parase.", start=16.2, end=28.0, words=[]),
+        SentenceSegment(id="S0004", text="En 1948 recibió el reconocimiento del rey Jorge por su legado.", start=28.2, end=38.0, words=[]),
+    ]
+    id_to_idx = {s.id: i for i, s in enumerate(sents)}
+    # Initial draft jumped from childhood/studies (S0001..S0002) straight to epilogue (S0004), skipping S0003 (core invention)
+    cand = ClipCandidate(
+        id="med_outline_test",
+        clip_type="medium",
+        aspect_ratio="16:9",
+        score=90,
+        slug="beatrice-outline",
+        titles=["La vida de Beatrice Shilling"],
+        summary="Historia de Beatrice Shilling.",
+        start_sentence_id="S0001",
+        end_sentence_id="S0004",
+        orig_start=0.0,
+        orig_end=38.0,
+        estimated_post_cut_sec=26.0,
+        narrative_spans=[
+            NarrativeSpan(start_sentence_id="S0001", end_sentence_id="S0002", orig_start=0.0, orig_end=16.0, role="core"),
+            NarrativeSpan(start_sentence_id="S0004", end_sentence_id="S0004", orig_start=28.2, orig_end=38.0, role="payoff"),
+        ],
+        standalone_packaging={
+            "video_outline": [
+                "Infancia y formación de Beatrice Shilling",
+                "Su invento clave del orificio/arandela en el carburador del Spitfire",
+                "Reconocimiento final",
+            ]
+        },
+    )
+
+    class _OutlineRepairMock:
+        def __init__(self) -> None:
+            self.repaired = False
+
+        def chat_json(self, role: str, system_prompt: str, user_prompt: str, **kwargs: Any) -> dict[str, Any]:
+            if "MINI-ÍNDICE PROPIO DE ESTE VÍDEO" in user_prompt:
+                has_invent = "arandela clave" in user_prompt
+                return {
+                    "covered": has_invent,
+                    "missing_beats": [] if has_invent else ["Su invento clave del orificio/arandela en el carburador del Spitfire"],
+                    "repair_instruction": "Incluye S0003 donde se explica la arandela del carburador.",
+                }
+            if "PRUEBA DE ESPECTADOR FRÍO" in user_prompt:
+                return {
+                    "who": "Beatrice Shilling",
+                    "what_and_context": "Ingeniera británica que salvó al Spitfire en 1940 y recibió honores.",
+                    "opening_4_6s_clear": True,
+                    "opening_issue": "",
+                    "central_question_or_conflict": "Cómo destacó en ingeniería y qué logró",
+                    "resolution_answered": True,
+                    "has_spoiler": False,
+                    "answer_or_mystery_stated": "Diseñó la solución del Spitfire y fue reconocida en 1948.",
+                    "clean_start": True,
+                    "clean_end": True,
+                    "splices_coherent": True,
+                    "broken_splices": [],
+                    "orphan_or_meta_refs": [],
+                    "missing_context_items": [],
+                    "comprehension_score": 9,
+                    "hook_strength": 8,
+                    "context_clarity": 9,
+                    "clean_boundaries": 9,
+                    "resolution_score": 9,
+                    "standalone_summary": "Beatrice Shilling salvó los motores del Spitfire.",
+                }
+            if "REPARACIÓN EDITORIAL" in user_prompt:
+                self.repaired = True
+                return {
+                    "action": "refine",
+                    "issue": "Incluido S0003 con el invento del carburador pedido en el mini-índice.",
+                    "drop_sentence_ids": [],
+                    "needs_ai_intro_curtain": False,
+                    "suggested_intro_curtain": "",
+                    "refined_spans": [{"start_sentence_id": "S0001", "end_sentence_id": "S0004", "role": "core"}],
+                }
+            return {}
+
+    mock = _OutlineRepairMock()
+    profile = PodcasterProfile(id="p", name="P", podcast_name="P", language="es", intro_curtain={"enabled": False})
+    res = _audit_and_refine_candidate(
+        cand=cand,
+        sentences=sents,
+        id_to_idx=id_to_idx,
+        target_window=DurationWindow(min_sec=15.0, max_sec=60.0),
+        silence_intervals=[],
+        audio_config=profile.audio,
+        energy_blocks=[],
+        llm=mock,  # type: ignore[arg-type]
+        profile=profile,
+    )
+    assert res is not None
+    assert mock.repaired is True
+    assert res.start_sentence_id == "S0001"
+    assert res.end_sentence_id == "S0004"
+    assert len(res.narrative_spans) == 1
+
+
+def test_trim_intro_cleanly_and_conversational_whisper_tolerance() -> None:
+    """Conversational lowercase starts and trailing commas stay allowed while orphan connectors snap cleanly."""
+    from backend.core.editorial_engine import (
+        _build_candidate_from_spans,
+        _run_cold_viewer_test,
+        _trim_intro_cleanly,
+    )
+    from backend.models.job import ClipCandidate, NarrativeSpan
+    from backend.models.profile import AudioEditConfig
+
+    trimmed = _trim_intro_cleanly(
+        "En 1942, tras la derrota en Gazala, el ejército británico se retiraba en desorden. "
+        "Su última esperanza era Mersa Matruh, pero sus defensas eran vulnerables.",
+        max_words=22,
+    )
+    assert trimmed.endswith("desorden.")
+    no_dangle = _trim_intro_cleanly(
+        "En junio de mil novecientos cuarenta y dos el general británico esperaba órdenes desesperadas en el puerto pero sus",
+        max_words=19,
+    )
+    assert not no_dangle.endswith(("sus.", "pero."))
+
+    sents = [
+        SentenceSegment(id="S0001", text="El ejército estaba cercado,", start=0.0, end=5.0, words=[]),
+        SentenceSegment(id="S0002", text="y sin munición ni agua.", start=5.1, end=10.0, words=[]),
+        SentenceSegment(id="S0003", text="fijan bayonetas para romper el cerco nocturno,", start=12.0, end=20.0, words=[]),
+        SentenceSegment(id="S0004", text="logrando escapar hacia Alejandría al amanecer.", start=20.2, end=28.0, words=[]),
+    ]
+    id_to_idx = {s.id: i for i, s in enumerate(sents)}
+    profile = PodcasterProfile(id="p", name="P", podcast_name="P", language="es", intro_curtain={"enabled": False})
+
+    # Span edge snap pulls S0002 back to S0001 because "y" is in _ORPHAN_START_WORDS with gap 0.1s
+    snapped = _build_candidate_from_spans(
+        raw={"score": 85, "titles": ["Cerco en el desierto"], "summary": "Cerco"},
+        spans_idx=[(1, 2, "core")],
+        clip_type="short_conclusive",
+        aspect_ratio="9:16",
+        sentences=sents,
+        id_to_idx=id_to_idx,
+        target_window=DurationWindow(min_sec=10.0, max_sec=60.0),
+        silence_intervals=[],
+        audio_config=AudioEditConfig(),
+        energy_blocks=[],
+        idx_counter=1,
+    )
+    assert snapped is not None
+    assert snapped.start_sentence_id == "S0001"
+
+    class _ConvJudgeMock:
+        def chat_json(self, role: str, system_prompt: str, user_prompt: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "who": "Brigada neozelandesa",
+                "what_and_context": "Carga nocturna a la bayoneta.",
+                "opening_4_6s_clear": True,
+                "opening_issue": "",
+                "central_question_or_conflict": "Cómo rompieron el cerco",
+                "resolution_answered": True,
+                "has_spoiler": False,
+                "answer_or_mystery_stated": "Escaparon al amanecer.",
+                "clean_start": True,
+                "clean_end": True,
+                "splices_coherent": True,
+                "broken_splices": [],
+                "orphan_or_meta_refs": [],
+                "missing_context_items": [],
+                "comprehension_score": 8,
+                "hook_strength": 8,
+                "context_clarity": 8,
+                "clean_boundaries": 8,
+                "resolution_score": 8,
+                "standalone_summary": "Rompieron el cerco.",
+            }
+
+    # Lowercase non-orphan opening S0003 ("fijan bayonetas...,") stays clean_start=True and clean_end=True
+    conv_cand = ClipCandidate(
+        id="c_conv",
+        clip_type="short_conclusive",
+        aspect_ratio="9:16",
+        score=85,
+        slug="c-conv",
+        titles=["Carga nocturna"],
+        summary="Carga",
+        start_sentence_id="S0003",
+        end_sentence_id="S0003",
+        orig_start=12.0,
+        orig_end=20.0,
+        estimated_post_cut_sec=8.0,
+        narrative_spans=[NarrativeSpan(start_sentence_id="S0003", end_sentence_id="S0003", orig_start=12.0, orig_end=20.0, role="core")],
+    )
+    ev_conv = _run_cold_viewer_test(conv_cand, sents, id_to_idx, _ConvJudgeMock())  # type: ignore[arg-type]
+    assert ev_conv["clean_start"] is True
+    assert ev_conv["clean_end"] is True
+
+    # Real orphan connector S0002 ("y sin munición...") with tight gap still flags clean_start=False
+    orphan_cand = ClipCandidate(
+        id="c_orp",
+        clip_type="short_conclusive",
+        aspect_ratio="9:16",
+        score=85,
+        slug="c-orp",
+        titles=["Orphan"],
+        summary="Orphan",
+        start_sentence_id="S0002",
+        end_sentence_id="S0003",
+        orig_start=5.1,
+        orig_end=20.0,
+        estimated_post_cut_sec=14.9,
+        narrative_spans=[NarrativeSpan(start_sentence_id="S0002", end_sentence_id="S0003", orig_start=5.1, orig_end=20.0, role="core")],
+    )
+    ev_orp = _run_cold_viewer_test(orphan_cand, sents, id_to_idx, _ConvJudgeMock())  # type: ignore[arg-type]
+    assert ev_orp["clean_start"] is False
+
+
+def test_severe_budget_exhausted_still_repairs_and_step_c_preserves_splices() -> None:
+    """Exhausted strong budget still runs cheap editorial repair, and Step C honors pre-intro splice coherence."""
+    from backend.core.editorial_engine import _audit_and_refine_candidate
+    from backend.models.job import ClipCandidate, NarrativeSpan
+
+    sents = [
+        SentenceSegment(id="S0001", text="El general Holmes queda aislado en Mersa Matruh en 1942.", start=0.0, end=10.0, words=[]),
+        SentenceSegment(id="S0002", text="Evalúa romper el cerco alemán esa misma noche.", start=10.3, end=20.0, words=[]),
+        SentenceSegment(id="S0003", text="Mientras Rommel esperaba la rendición británica al amanecer.", start=20.3, end=30.0, words=[]),
+    ]
+    id_to_idx = {s.id: i for i, s in enumerate(sents)}
+    cand = ClipCandidate(
+        id="c_stepc",
+        clip_type="short_conclusive",
+        aspect_ratio="9:16",
+        score=88,
+        slug="holmes-cerco",
+        titles=["El cerco a Holmes"],
+        summary="El cerco en Mersa Matruh.",
+        start_sentence_id="S0002",
+        end_sentence_id="S0003",
+        orig_start=10.3,
+        orig_end=30.0,
+        estimated_post_cut_sec=19.7,
+        narrative_spans=[NarrativeSpan(start_sentence_id="S0002", end_sentence_id="S0003", orig_start=10.3, orig_end=30.0, role="core")],
+    )
+
+    class _RepairAndStepCMock:
+        def __init__(self) -> None:
+            self.repair_roles: list[str] = []
+
+        def chat_json(self, role: str, system_prompt: str, user_prompt: str, **kwargs: Any) -> dict[str, Any]:
+            if "PRUEBA DE ESPECTADOR FRÍO" in user_prompt:
+                if "[INTRO IA]:" in user_prompt:
+                    return {
+                        "who": "General Holmes",
+                        "what_and_context": "Aislado en Mersa Matruh en junio de 1942 intenta romper el cerco.",
+                        "opening_4_6s_clear": True,
+                        "opening_issue": "",
+                        "central_question_or_conflict": "Si logrará romper el cerco",
+                        "resolution_answered": True,
+                        "has_spoiler": False,
+                        "answer_or_mystery_stated": "Intentó escapar por la noche.",
+                        "clean_start": True,
+                        "clean_end": True,
+                        "splices_coherent": False,
+                        "broken_splices": [],
+                        "orphan_or_meta_refs": [],
+                        "missing_context_items": [],
+                        "comprehension_score": 5,
+                        "hook_strength": 8,
+                        "context_clarity": 8,
+                        "clean_boundaries": 8,
+                        "resolution_score": 8,
+                        "standalone_summary": "Holmes escapó en Mersa Matruh.",
+                    }
+                if "El general Holmes" in user_prompt:
+                    return {
+                        "who": "General Holmes",
+                        "what_and_context": "Aislado en Mersa Matruh en 1942.",
+                        "opening_4_6s_clear": False,
+                        "opening_issue": "Necesita contexto adicional de época.",
+                        "central_question_or_conflict": "Cómo escapar del cerco",
+                        "resolution_answered": True,
+                        "has_spoiler": False,
+                        "answer_or_mystery_stated": "Rompió el cerco.",
+                        "clean_start": True,
+                        "clean_end": True,
+                        "splices_coherent": True,
+                        "broken_splices": [],
+                        "orphan_or_meta_refs": [],
+                        "missing_context_items": [],
+                        "comprehension_score": 6,
+                        "hook_strength": 7,
+                        "context_clarity": 5,
+                        "clean_boundaries": 8,
+                        "resolution_score": 8,
+                        "standalone_summary": "Holmes en Mersa Matruh.",
+                    }
+                return {
+                    "who": "DESCONOCIDO",
+                    "what_and_context": "DESCONOCIDO",
+                    "opening_4_6s_clear": False,
+                    "opening_issue": "Falta sujeto",
+                    "central_question_or_conflict": "Falta",
+                    "resolution_answered": False,
+                    "has_spoiler": False,
+                    "answer_or_mystery_stated": "",
+                    "clean_start": False,
+                    "clean_end": True,
+                    "splices_coherent": True,
+                    "broken_splices": [],
+                    "orphan_or_meta_refs": [],
+                    "missing_context_items": ["Sujeto"],
+                    "comprehension_score": 4,
+                    "hook_strength": 5,
+                    "context_clarity": 4,
+                    "clean_boundaries": 5,
+                    "resolution_score": 4,
+                    "standalone_summary": "",
+                }
+            if "REPARACIÓN EDITORIAL" in user_prompt:
+                self.repair_roles.append(role)
+                return {
+                    "action": "refine",
+                    "issue": "Añadido S0001 para identificar a Holmes",
+                    "drop_sentence_ids": [],
+                    "needs_ai_intro_curtain": True,
+                    "suggested_intro_curtain": "En junio de 1942 el general Holmes quedó cercado en Mersa Matruh.",
+                    "refined_spans": [
+                        {"start_sentence_id": "S0001", "end_sentence_id": "S0001", "role": "context_intro"},
+                        {"start_sentence_id": "S0003", "end_sentence_id": "S0003", "role": "core"},
+                    ],
+                }
+            if "CORTINILLA DE APERTURA" in system_prompt:
+                return {
+                    "spoken_hook": "En junio de 1942 el general Holmes quedó cercado en Mersa Matruh frente a Rommel.",
+                    "phrases": ["Junio de 1942", "El general Holmes", "cercado en Mersa Matruh"],
+                    "badge": "CONTEXTO CLAVE",
+                }
+            return {}
+
+    mock = _RepairAndStepCMock()
+    profile = PodcasterProfile(id="p", name="P", podcast_name="P", language="es", intro_curtain={"enabled": True})
+    res = _audit_and_refine_candidate(
+        cand=cand,
+        sentences=sents,
+        id_to_idx=id_to_idx,
+        target_window=DurationWindow(min_sec=15.0, max_sec=60.0),
+        silence_intervals=[],
+        audio_config=profile.audio,
+        energy_blocks=[],
+        llm=mock,  # type: ignore[arg-type]
+        allow_strong_escalation=False,
+        profile=profile,
+    )
+    assert "editorial" in mock.repair_roles
+    assert res is not None
+    assert res.intro_curtain_enabled is True
+    assert res.standalone_packaging.get("audit_action") == "refine->approve_needs_intro"
+
+
+def test_step_c_evaluates_best_repaired_cand_when_raw_whisper_fails_without_intro() -> None:
+    """Step B repair feeds best_repaired_cand into Step C even if un-framed conversational Whisper scored low."""
+    from backend.core.editorial_engine import _audit_and_refine_candidate
+    from backend.models.job import ClipCandidate, NarrativeSpan
+
+    sents = [
+        SentenceSegment(id="S0001", text="a ver los británicos no se entendieron en Marsa Matruh", start=0.0, end=12.0, words=[]),
+        SentenceSegment(id="S0002", text="Rommel aprovechó la brecha entre las divisiones aliadas", start=12.2, end=25.0, words=[]),
+    ]
+    id_to_idx = {s.id: i for i, s in enumerate(sents)}
+    cand = ClipCandidate(
+        id="c_rep_stepc",
+        clip_type="medium",
+        aspect_ratio="16:9",
+        score=86,
+        slug="marsa-repair",
+        titles=["El fallo de Marsa Matruh"],
+        summary="Fallo táctico en Marsa Matruh.",
+        start_sentence_id="S0001",
+        end_sentence_id="S0002",
+        orig_start=0.0,
+        orig_end=25.0,
+        estimated_post_cut_sec=25.0,
+        narrative_spans=[NarrativeSpan(start_sentence_id="S0001", end_sentence_id="S0002", orig_start=0.0, orig_end=25.0, role="core")],
+    )
+
+    class _StepCMock:
+        def __init__(self, fail_intro_who: bool = False) -> None:
+            self.fail_intro_who = fail_intro_who
+            self.intro_checked = False
+
+        def chat_json(self, role: str, system_prompt: str, user_prompt: str, **kwargs: Any) -> dict[str, Any]:
+            if "PRUEBA DE ESPECTADOR FRÍO" in user_prompt:
+                if "[INTRO IA]:" in user_prompt:
+                    self.intro_checked = True
+                    return {
+                        "who": "DESCONOCIDO" if self.fail_intro_who else "Ejército británico y Rommel",
+                        "what_and_context": "Alguien habla de algo sin nombrar lugar ni protagonistas." if self.fail_intro_who else "En 1942 en Marsa Matruh los fallos de mando abrieron paso a Rommel.",
+                        "opening_4_6s_clear": not self.fail_intro_who,
+                        "opening_issue": "",
+                        "central_question_or_conflict": "Por qué cayó Marsa Matruh",
+                        "resolution_answered": False,
+                        "has_spoiler": False,
+                        "answer_or_mystery_stated": "Falta de coordinación.",
+                        "clean_start": True,
+                        "clean_end": False,
+                        "splices_coherent": True,
+                        "broken_splices": [],
+                        "orphan_or_meta_refs": [],
+                        "missing_context_items": [],
+                        "comprehension_score": 7,
+                        "hook_strength": 8,
+                        "context_clarity": 8,
+                        "clean_boundaries": 7,
+                        "resolution_score": 6,
+                        "standalone_summary": "Caída de Marsa Matruh por desorden británico.",
+                    }
+                return {
+                    "who": "DESCONOCIDO",
+                    "what_and_context": "DESCONOCIDO",
+                    "opening_4_6s_clear": False,
+                    "opening_issue": "Falta sujeto sin intro",
+                    "central_question_or_conflict": "Falta",
+                    "resolution_answered": False,
+                    "has_spoiler": False,
+                    "answer_or_mystery_stated": "",
+                    "clean_start": False,
+                    "clean_end": False,
+                    "splices_coherent": True,
+                    "broken_splices": [],
+                    "orphan_or_meta_refs": [],
+                    "missing_context_items": ["Sujeto"],
+                    "comprehension_score": 4,
+                    "hook_strength": 5,
+                    "context_clarity": 4,
+                    "clean_boundaries": 4,
+                    "resolution_score": 4,
+                    "standalone_summary": "",
+                }
+            if "REPARACIÓN EDITORIAL" in user_prompt:
+                return {
+                    "action": "refine",
+                    "issue": "Tramo limpio listo para enmarcar con cortinilla IA.",
+                    "drop_sentence_ids": [],
+                    "needs_ai_intro_curtain": True,
+                    "suggested_intro_curtain": "En junio de 1942 el ejército británico se jugaba Egipto frente a Rommel en Marsa Matruh.",
+                    "refined_spans": [{"start_sentence_id": "S0001", "end_sentence_id": "S0002", "role": "core"}],
+                }
+            if "CORTINILLA DE APERTURA" in system_prompt:
+                return {
+                    "spoken_hook": "En junio de 1942 el ejército británico se jugaba Egipto frente a Rommel en Marsa Matruh.",
+                    "phrases": ["Junio de 1942", "Egipto en juego", "Marsa Matruh"],
+                    "badge": "MARSA MATRUH 1942",
+                }
+            return {}
+
+    profile = PodcasterProfile(id="p", name="P", podcast_name="P", language="es", intro_curtain={"enabled": True})
+    mock_ok = _StepCMock(fail_intro_who=False)
+    approved = _audit_and_refine_candidate(
+        cand=cand,
+        sentences=sents,
+        id_to_idx=id_to_idx,
+        target_window=DurationWindow(min_sec=15.0, max_sec=60.0),
+        silence_intervals=[],
+        audio_config=profile.audio,
+        energy_blocks=[],
+        llm=mock_ok,  # type: ignore[arg-type]
+        profile=profile,
+    )
+    assert mock_ok.intro_checked is True
+    assert approved is not None
+    assert approved.intro_curtain_enabled is True
+    assert approved.standalone_packaging.get("audit_action") == "editorial_strong_refine->needs_intro"
+
+    mock_bad = _StepCMock(fail_intro_who=True)
+    rejected = _audit_and_refine_candidate(
+        cand=cand,
+        sentences=sents,
+        id_to_idx=id_to_idx,
+        target_window=DurationWindow(min_sec=15.0, max_sec=60.0),
+        silence_intervals=[],
+        audio_config=profile.audio,
+        energy_blocks=[],
+        llm=mock_bad,  # type: ignore[arg-type]
+        profile=profile,
+    )
+    assert mock_bad.intro_checked is True
+    assert rejected is None
+
+
+def test_cliffhanger_raw_res_and_collective_who_with_intro() -> None:
+    """Cliffhangers with resolution_answered=False and multi-actor stories with named entities pass Step C."""
+    from backend.core.editorial_engine import _audit_and_refine_candidate, _run_cold_viewer_test
+    from backend.models.job import ClipCandidate, NarrativeSpan
+
+    sents = [
+        SentenceSegment(
+            id="S0001",
+            text="En Mersa Matruh las unidades británicas e indias quedan rodeadas tras la derrota de Tobruk.",
+            start=0.0,
+            end=15.0,
+            words=[],
+        ),
+        SentenceSegment(
+            id="S0002",
+            text="Rommel avanza sobre El Alamein mientras las órdenes no llegan al frente.",
+            start=15.2,
+            end=30.0,
+            words=[],
+        ),
+    ]
+    id_to_idx = {s.id: i for i, s in enumerate(sents)}
+
+    cliff_cand = ClipCandidate(
+        id="c_cliff_raw",
+        clip_type="short_cliffhanger",
+        aspect_ratio="9:16",
+        score=88,
+        slug="cliff-raw-res",
+        titles=["6000 rodeados en Mersa Matruh"],
+        summary="Cerco en Mersa Matruh.",
+        start_sentence_id="S0001",
+        end_sentence_id="S0002",
+        orig_start=0.0,
+        orig_end=30.0,
+        estimated_post_cut_sec=30.0,
+        narrative_spans=[NarrativeSpan(start_sentence_id="S0001", end_sentence_id="S0002", orig_start=0.0, orig_end=30.0, role="core")],
+    )
+
+    class _CliffAndCollectiveMock:
+        def chat_json(self, role: str, system_prompt: str, user_prompt: str, **kwargs: Any) -> dict[str, Any]:
+            if "PRUEBA DE ESPECTADOR FRÍO" in user_prompt:
+                if "[INTRO IA]:" in user_prompt:
+                    return {
+                        "who": "10º Cuerpo británico y Rommel",
+                        "what_and_context": "En 1942 el 10º Cuerpo británico queda cercado en Mersa Matruh por Rommel.",
+                        "opening_4_6s_clear": True,
+                        "opening_issue": "",
+                        "central_question_or_conflict": "Si lograrán escapar del cerco en Mersa Matruh",
+                        "resolution_answered": False,
+                        "has_spoiler": False,
+                        "answer_or_mystery_stated": "Quedan atrapados sin órdenes claras.",
+                        "clean_start": True,
+                        "clean_end": True,
+                        "splices_coherent": True,
+                        "broken_splices": [],
+                        "orphan_or_meta_refs": [],
+                        "missing_context_items": [],
+                        "comprehension_score": 7,
+                        "hook_strength": 8,
+                        "context_clarity": 9,
+                        "clean_boundaries": 8,
+                        "resolution_score": 7,
+                        "standalone_summary": "Cerco en Mersa Matruh sin desenlace.",
+                    }
+                return {
+                    "who": "DESCONOCIDO",
+                    "what_and_context": "DESCONOCIDO",
+                    "opening_4_6s_clear": False,
+                    "opening_issue": "Falta contexto inicial",
+                    "central_question_or_conflict": "Cerco en el desierto",
+                    "resolution_answered": False,
+                    "has_spoiler": False,
+                    "answer_or_mystery_stated": "",
+                    "clean_start": False,
+                    "clean_end": False,
+                    "splices_coherent": True,
+                    "broken_splices": [],
+                    "orphan_or_meta_refs": [],
+                    "missing_context_items": ["Contexto"],
+                    "comprehension_score": 4,
+                    "hook_strength": 5,
+                    "context_clarity": 4,
+                    "clean_boundaries": 4,
+                    "resolution_score": 4,
+                    "standalone_summary": "",
+                }
+            if "REPARACIÓN EDITORIAL" in user_prompt:
+                return {
+                    "action": "refine",
+                    "issue": "Tramo limpio para cortinilla IA.",
+                    "drop_sentence_ids": [],
+                    "needs_ai_intro_curtain": True,
+                    "suggested_intro_curtain": "En junio de 1942, Rommel cercó al 10º Cuerpo británico en Mersa Matruh.",
+                    "refined_spans": [{"start_sentence_id": "S0001", "end_sentence_id": "S0002", "role": "core"}],
+                }
+            if "CORTINILLA DE APERTURA" in system_prompt:
+                return {
+                    "spoken_hook": "En junio de 1942, Rommel cercó al 10º Cuerpo británico en Mersa Matruh sin salida.",
+                    "phrases": ["Junio de 1942", "Rommel cercó", "al 10º Cuerpo británico"],
+                    "badge": "MARSA MATRUH",
+                }
+            return {}
+
+    profile = PodcasterProfile(id="p", name="P", podcast_name="P", language="es", intro_curtain={"enabled": True})
+    approved = _audit_and_refine_candidate(
+        cand=cliff_cand,
+        sentences=sents,
+        id_to_idx=id_to_idx,
+        target_window=DurationWindow(min_sec=15.0, max_sec=60.0),
+        silence_intervals=[],
+        audio_config=profile.audio,
+        energy_blocks=[],
+        llm=_CliffAndCollectiveMock(),  # type: ignore[arg-type]
+        profile=profile,
+    )
+    assert approved is not None
+    assert approved.intro_curtain_enabled is True
+
+    class _CollectiveWhoFallbackMock:
+        def chat_json(self, role: str, system_prompt: str, user_prompt: str, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "who": "DESCONOCIDO",
+                "what_and_context": "En 1942, tras la derrota en Tobruk, los aliados se reagrupan en El Alamein frente a Rommel.",
+                "opening_4_6s_clear": True,
+                "opening_issue": "",
+                "central_question_or_conflict": "Cómo frenar a Rommel",
+                "resolution_answered": False,
+                "has_spoiler": False,
+                "answer_or_mystery_stated": "Se reagruparon en El Alamein.",
+                "clean_start": True,
+                "clean_end": True,
+                "splices_coherent": True,
+                "broken_splices": [],
+                "orphan_or_meta_refs": [],
+                "missing_context_items": [],
+                "comprehension_score": 7,
+                "hook_strength": 8,
+                "context_clarity": 8,
+                "clean_boundaries": 8,
+                "resolution_score": 7,
+                "standalone_summary": "Retirada hacia El Alamein.",
+            }
+
+    cliff_cand.intro_curtain_text = "En 1942 los aliados intentan frenar a Rommel en El Alamein."
+    ev_col = _run_cold_viewer_test(
+        cliff_cand,
+        sents,
+        id_to_idx,
+        _CollectiveWhoFallbackMock(),  # type: ignore[arg-type]
+        visual_bible={"proper_nouns": ["Rommel", "El Alamein", "Tobruk"]},
+        include_intro_curtain=True,
+    )
+    assert ev_col["who_unknown"] is False
+    assert ev_col["context_clarity"] >= 80
+    assert ev_col["raw_resolution_score"] == 70
+
+
+def test_grounded_glossary_blocks_contamination_and_refines_pass2() -> None:
+    from backend.core.editorial_engine import (
+        extract_episode_glossary_and_bible,
+        refine_clip_glossary_from_pass2,
+    )
+    from backend.models.job import WordTimestamp
+
+    sents = [
+        SentenceSegment(id="S0001", start=0.0, end=5.0, text="En junio de 1942 Romer avanzó por el desierto."),
+        SentenceSegment(id="S0002", start=5.0, end=10.0, text="El cuerpo británico se replegó hacia Matruc."),
+    ]
+    profile = PodcasterProfile(id="p", name="P", podcast_name="Historia", language="es")
+
+    class _ContaminatedGlossaryLLM:
+        def chat_json(self, role: str, system_prompt: str, user_prompt: str, **kwargs: Any) -> dict[str, Any]:
+            if "lingüista forense" in system_prompt or "glossary" in user_prompt:
+                return {
+                    "episode_topic": "Batalla de Mersa Matruh",
+                    "era_or_setting": "Junio de 1942, Norte de África",
+                    "niche_category": "historia",
+                    "proper_nouns": ["Erwin Rommel", "Mersa Matruh"],
+                    "glossary": {
+                        "Rorro y Merlin": "Rolls-Royce Merlin",
+                        "Beatriz Silling": "Beatrice Shilling",
+                        "RIA": "RAE",
+                        "Romer": "Rommel",
+                    },
+                    "visual_bible": {
+                        "visual_style": "historical desert warfare",
+                        "prefer_historical_archive": True,
+                        "forbidden_anachronisms": [],
+                        "concrete_filmable_motifs": ["desert tank convoy"],
+                        "fallback_query": "desert armored column",
+                    },
+                }
+            if "PASADA 2" in user_prompt:
+                return {
+                    "fixes": {
+                        "Matruc": "Mersa Matruh",
+                        "Inventado Fantasma": "Ghost Division",
+                    }
+                }
+            return {}
+
+    glossary, vb = extract_episode_glossary_and_bible(sents, [], profile, _ContaminatedGlossaryLLM())  # type: ignore[arg-type]
+    assert glossary == {"Romer": "Rommel"}
+    assert "Rorro y Merlin" not in glossary
+    assert "Beatriz Silling" not in glossary
+    assert "RIA" not in glossary
+
+    p2_words = [
+        WordTimestamp(word="El", start=4.6, end=4.8),
+        WordTimestamp(word="ejército", start=4.8, end=5.1),
+        WordTimestamp(word="avanzó", start=5.1, end=5.3),
+        WordTimestamp(word="hacia", start=5.3, end=5.5),
+        WordTimestamp(word="Matruc", start=5.5, end=6.0),
+        WordTimestamp(word="en", start=6.1, end=6.3),
+        WordTimestamp(word="1942.", start=6.4, end=6.9),
+    ]
+    p2_fixes = refine_clip_glossary_from_pass2(p2_words, vb, glossary, _ContaminatedGlossaryLLM())  # type: ignore[arg-type]
+    assert p2_fixes == {"Matruc": "Mersa Matruh"}
+
+
+def test_do_no_harm_repair_intro_parity_and_dedup_signatures() -> None:
+    from backend.core.editorial_engine import (
+        _audit_and_refine_candidate,
+        _deduplicate_and_audit,
+        generate_intro_curtain_script,
+    )
+    from backend.models.job import ClipCandidate, ClipMetadata, NarrativeSpan
+
+    sents = [
+        SentenceSegment(id="S0001", start=0.0, end=8.0, text="Avanzaron en silencio por la noche."),
+        SentenceSegment(id="S0002", start=8.0, end=16.0, text="Al amanecer tomaron el nido de ametralladoras."),
+        SentenceSegment(id="S0003", start=16.0, end=24.0, text="El batallón maorí resistió el contraataque."),
+    ]
+    id_to_idx = {s.id: i for i, s in enumerate(sents)}
+    profile = PodcasterProfile(id="p", name="P", podcast_name="P", language="es", intro_curtain={"enabled": True})
+
+    class _HarmfulRepairMock:
+        def __init__(self) -> None:
+            self.eval_calls = 0
+
+        def chat_json(self, role: str, system_prompt: str, user_prompt: str, **kwargs: Any) -> dict[str, Any]:
+            if "PRUEBA DE ESPECTADOR FRÍO" in user_prompt:
+                self.eval_calls += 1
+                if "[INTRO IA]" in user_prompt:
+                    return {
+                        "who": "El batallón maorí en Mersa Matruh",
+                        "what_and_context": "En 1942 rompieron el cerco alemán en Mersa Matruh.",
+                        "opening_4_6s_clear": True,
+                        "resolution_answered": True,
+                        "clean_start": True,
+                        "clean_end": True,
+                        "splices_coherent": True,
+                        "broken_splices": [],
+                        "has_spoiler": False,
+                        "comprehension_score": 8,
+                        "hook_strength": 8,
+                        "context_clarity": 9,
+                        "clean_boundaries": 8,
+                        "resolution_score": 8,
+                        "standalone_summary": "Carga nocturna maorí.",
+                    }
+                if self.eval_calls == 1:
+                    # Healthy body, lacking WHO at 0-4s
+                    return {
+                        "who": "DESCONOCIDO",
+                        "what_and_context": "DESCONOCIDO",
+                        "opening_4_6s_clear": False,
+                        "resolution_answered": False,
+                        "clean_start": True,
+                        "clean_end": True,
+                        "splices_coherent": True,
+                        "broken_splices": [],
+                        "has_spoiler": False,
+                        "comprehension_score": 6,
+                        "hook_strength": 7,
+                        "context_clarity": 5,
+                        "clean_boundaries": 8,
+                        "resolution_score": 9,
+                        "standalone_summary": "Asalto nocturno.",
+                    }
+                # Post-repair evaluation fails splices (simulating NLE harm)
+                return {
+                    "who": "DESCONOCIDO",
+                    "what_and_context": "DESCONOCIDO",
+                    "opening_4_6s_clear": False,
+                    "resolution_answered": False,
+                    "clean_start": False,
+                    "clean_end": True,
+                    "splices_coherent": False,
+                    "broken_splices": ["Corte brusco"],
+                    "has_spoiler": False,
+                    "comprehension_score": 4,
+                    "hook_strength": 4,
+                    "context_clarity": 4,
+                    "clean_boundaries": 4,
+                    "resolution_score": 4,
+                }
+            if "REPARACIÓN EDITORIAL" in user_prompt:
+                return {
+                    "action": "refine",
+                    "issue": "Intento de empalme",
+                    "refined_spans": [
+                        {"start_sentence_id": "S0001", "end_sentence_id": "S0001", "role": "context"},
+                        {"start_sentence_id": "S0003", "end_sentence_id": "S0003", "role": "payoff"},
+                    ],
+                }
+            if "CORTINILLA DE APERTURA" in system_prompt:
+                return {
+                    "spoken_hook": "En junio de 1942 el batallón maorí cargó de noche en Mersa Matruh.",
+                    "phrases": ["Junio de 1942", "carga nocturna"],  # intentionally omits words!
+                    "badge": "MERSA MATRUH",
+                }
+            return {}
+
+    cand = ClipCandidate(
+        id="c_maori",
+        candidate_id="cand_maori",
+        original_title="Carga maorí",
+        clip_type="short_conclusive",
+        aspect_ratio="9:16",
+        score=90,
+        slug="carga-maori",
+        start_sentence_id="S0001",
+        end_sentence_id="S0003",
+        orig_start=0.0,
+        orig_end=24.0,
+        estimated_post_cut_sec=24.0,
+        narrative_spans=[NarrativeSpan(start_sentence_id="S0001", end_sentence_id="S0003", orig_start=0.0, orig_end=24.0, role="core")],
+        metadata=ClipMetadata(titles=["Carga maorí"]),
+    )
+
+    mock = _HarmfulRepairMock()
+    res = _audit_and_refine_candidate(
+        cand=cand.model_copy(deep=True),
+        sentences=sents,
+        id_to_idx=id_to_idx,
+        target_window=DurationWindow(min_sec=15.0, max_sec=60.0),
+        silence_intervals=[],
+        audio_config=profile.audio,
+        energy_blocks=[],
+        llm=mock,  # type: ignore[arg-type]
+        profile=profile,
+    )
+    assert res is not None
+    # Original unbroken 1-span body preserved by Do-No-Harm guard
+    assert len(res.narrative_spans) == 1
+    assert res.intro_curtain_enabled is True
+    assert len(res.intro_curtain_text.split()) <= 17
+    assert " ".join(res.intro_curtain_phrases).lower().replace(",", "").replace(".", "") == res.intro_curtain_text.lower().replace(",", "").replace(".", "")
+
+    # Ensure generate_intro_curtain_script always enforces exact word parity
+    script = generate_intro_curtain_script(cand, profile, {}, mock, sentences=sents, id_to_idx=id_to_idx)  # type: ignore[arg-type]
+    assert len(script["spoken_hook"].split()) <= 17
+    assert " ".join(script["phrases"]).split() == script["spoken_hook"].split()
+
+    # Verify audited_signatures avoids re-auditing previously failed candidate
+    audited_sigs: set[str] = {"short_conclusive:S0001-S0003"}
+    calls_before = mock.eval_calls
+    chosen = _deduplicate_and_audit(
+        [cand.model_copy(deep=True)],
+        requested=1,
+        existing_short_spans=[],
+        longform_spans=[],
+        allow_short_as_teaser=True,
+        clip_type="short_conclusive",
+        sentences=sents,
+        id_to_idx=id_to_idx,
+        window=DurationWindow(min_sec=15.0, max_sec=60.0),
+        silence_intervals=[],
+        energy_blocks=[],
+        profile=profile,
+        llm=mock,  # type: ignore[arg-type]
+        allow_fallback=False,
+        audited_signatures=audited_sigs,
+    )
+    assert chosen == []
+    assert mock.eval_calls == calls_before
+
+
+
+
 

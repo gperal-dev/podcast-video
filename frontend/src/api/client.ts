@@ -203,6 +203,35 @@ export const api = {
       body: JSON.stringify({ clips }),
     }),
   approveJob: (jobId: string) => jsonReq<JobState>(`/api/jobs/${jobId}/approve`, { method: "POST" }),
+  selectTopics: (
+    jobId: string,
+    selections: {
+      candidate_id?: string | null;
+      id?: string;
+      clip_type?: string;
+      intro_curtain_enabled?: boolean | null;
+      title?: string;
+    }[],
+    pauseBeforeRender?: boolean,
+  ) =>
+    jsonReq<JobState>(`/api/jobs/${jobId}/select-topics`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        selections,
+        pause_before_render: pauseBeforeRender,
+      }),
+    }),
+  proposeBlock: (jobId: string, blockIndex: number, clipType = "short_conclusive") =>
+    jsonReq<Record<string, unknown>>(`/api/jobs/${jobId}/propose-block`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ block_index: blockIndex, clip_type: clipType }),
+    }),
+  getJobLogs: (jobId: string) =>
+    jsonReq<{ job_id: string; events: Record<string, unknown>[] }>(`/api/jobs/${jobId}/logs`),
+  sourceAudioUrl: (jobId: string) =>
+    `/api/media/processing/${encodeURIComponent(jobId)}/source-audio`,
 
   getWatcher: () => jsonReq<WatcherStatus>("/api/watcher"),
   startWatcher: (profileId: string) =>

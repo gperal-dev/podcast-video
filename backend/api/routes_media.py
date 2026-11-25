@@ -96,6 +96,20 @@ def stream_output_file(subpath: str, download: bool = False) -> FileResponse:
     return FileResponse(target, headers=headers)
 
 
+@router.api_route("/processing/{job_id}/source-audio", methods=["GET", "HEAD"])
+def stream_source_audio(job_id: str) -> FileResponse:
+    """Stream the source episode audio for Semi-Auto segment previewing."""
+    settings = get_settings()
+    job_file = (settings.processing_dir / job_id / "job.json").resolve()
+    if not job_file.is_relative_to(settings.processing_dir.resolve()) or not job_file.exists():
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado.")
+    job_data = json.loads(job_file.read_text(encoding="utf-8"))
+    src_path = Path(str(job_data.get("source_audio_path") or ""))
+    if not src_path.exists() or not src_path.is_file():
+        raise HTTPException(status_code=404, detail="Audio fuente no encontrado.")
+    return FileResponse(src_path)
+
+
 @router.api_route("/processing/{job_id}/{subpath:path}", methods=["GET", "HEAD"])
 def stream_processing_file(job_id: str, subpath: str, download: bool = False) -> FileResponse:
     """Safely serve audio previews, thumbnails, and license manifests inside processing/<job_id>/."""

@@ -51,6 +51,7 @@ def _reconstruct_phase_timings(
     events = telemetry_events or []
     phase_starts: dict[str, float] = {}
     phase_ends: dict[str, float] = {}
+    active_run_ph: set[str] = set()
 
     for ev in events:
         if ev.get("type") != "phase_timing":
@@ -59,10 +60,16 @@ def _reconstruct_phase_timings(
         ts = _parse_iso(ev.get("ts"))
         if not ph or ts is None:
             continue
-        if ph not in phase_starts:
+        st = str(ev.get("status") or "")
+        if st == "running" and ph not in active_run_ph:
             phase_starts[ph] = ts
-        if ev.get("status") in ("completed", "failed", "skipped"):
+            phase_ends.pop(ph, None)
+            active_run_ph.add(ph)
+        elif ph not in phase_starts:
+            phase_starts[ph] = ts
+        if st in ("completed", "failed", "skipped"):
             phase_ends[ph] = ts
+            active_run_ph.discard(ph)
 
     logs = job.get("logs") or []
     t_created = _parse_iso(job.get("created_at"))
@@ -84,26 +91,26 @@ def _reconstruct_phase_timings(
         ts = _parse_iso(entry.get("ts"))
         if ts is None:
             continue
-        if "Fase 1 completada" in msg and "p1_end" not in log_markers:
+        if "Iniciando trabajo '" in msg:
+            log_markers["run_start"] = ts
+        elif "Fase 1 completada" in msg or "Fase 1 acelerada" in msg:
             log_markers["p1_end"] = ts
-        elif "Fase 2 completada" in msg and "p2_end" not in log_markers:
+        elif "Fase 2 completada" in msg:
             log_markers["p2_end"] = ts
-        elif "Pasada 2 + EDL" in msg and "p3_start" not in log_markers:
-            log_markers["p3_start"] = ts
-        elif ("Fase 3 completada" in msg or "Generando storyboards" in msg or "Storyboards" in msg) and "p3_end" not in log_markers:
+        elif "Pasada 2 + EDL" in msg and ("p3_start" not in log_markers or ts > log_markers.get("p2_end", 0.0)):
+            log_markers.setdefault("p3_start", ts)
+        elif "Fase 3 completada" in msg or "EDL y audios limpios listos" in msg or "Generando storyboards" in msg:
             log_markers["p3_end"] = ts
-        elif "Fase 4 completada" in msg and "p4_end" not in log_markers:
+        elif "Fase 4 completada" in msg:
             log_markers["p4_end"] = ts
-        elif "Fase 5 iniciada" in msg and "p5_start" not in log_markers:
+        elif "Fase 5 iniciada" in msg:
             log_markers["p5_start"] = ts
         elif "¡Producción finalizada!" in msg:
             log_markers["p5_end"] = ts
 
-        # Detect start of phase 4 from first storyboard/stock log when no explicit Fase 3 completed log exists
-        if "p4_start" not in log_markers and (
-            "] Plano " in msg or "storyboard" in msg.lower() or "Director Visual" in msg
-        ):
-            log_markers["p4_start"] = ts
+        if "] Plano " in msg or "storyboard" in msg.lower() or "Director Visual" in msg:
+            if "p4_start" not in log_markers or (log_markers.get("p3_end") and ts >= log_markers["p3_end"]):
+                log_markers.setdefault("p4_start", ts)
 
         m_ren_start = re.search(r"Renderizando MP4 final:\s*([^\s.]+\.mp4)", msg)
         if m_ren_start:
@@ -115,13 +122,13 @@ def _reconstruct_phase_timings(
                 clip_render_durations[fn] = round(max(0.0, ts - clip_render_starts[fn]), 2)
 
     if not phase_starts and t_created is not None:
-        p1_start = t_created
+        p1_start = log_markers.get("run_start") or t_created
         p1_end = log_markers.get("p1_end")
         p2_start = p1_end
         p2_end = log_markers.get("p2_end")
         p3_start = p2_end or log_markers.get("p3_start")
-        p3_end = log_markers.get("p4_start") or log_markers.get("p3_end")
-        p4_start = p3_end
+        p3_end = log_markers.get("p3_end") or log_markers.get("p4_start")
+        p4_start = p3_end or log_markers.get("p4_start")
         p4_end = log_markers.get("p4_end") or log_markers.get("p5_start")
         p5_start = log_markers.get("p5_start") or p4_end
         p5_end = log_markers.get("p5_end") or (t_updated if job.get("status") == "completed" else None)
@@ -134,22 +141,33 @@ def _reconstruct_phase_timings(
             "rendering": (p5_start, p5_end),
         }
         for ph, (s_t, e_t) in bounds.items():
-            if s_t is not None:
+            if s_t is not None and e_t is not None and e_t >= s_t:
                 phase_starts[ph] = s_t
-            if e_t is not None:
                 phase_ends[ph] = e_t
 
-    total_sec = round(max(0.0, (t_updated - t_created)), 2) if (t_created and t_updated and t_updated >= t_created) else 0.0
     phases_status = {p.get("phase"): p for p in (job.get("phases") or [])}
     out_phases: list[dict[str, Any]] = []
     known_sum = 0.0
     for ph in PHASE_ORDER:
-        s_t = phase_starts.get(ph)
-        e_t = phase_ends.get(ph)
-        dur = round(max(0.0, e_t - s_t), 2) if (s_t is not None and e_t is not None and e_t >= s_t) else None
+        st_obj = phases_status.get(ph) or {}
+        dur: Optional[float] = None
+        if st_obj.get("duration_sec") is not None:
+            try:
+                dur = round(max(0.0, float(st_obj["duration_sec"])), 2)
+            except Exception:
+                dur = None
+        if dur is None:
+            ph_s_iso = _parse_iso(st_obj.get("started_at"))
+            ph_e_iso = _parse_iso(st_obj.get("completed_at"))
+            if ph_s_iso is not None and ph_e_iso is not None and ph_e_iso >= ph_s_iso:
+                dur = round(max(0.0, ph_e_iso - ph_s_iso), 2)
+        if dur is None:
+            s_t = phase_starts.get(ph)
+            e_t = phase_ends.get(ph)
+            if s_t is not None and e_t is not None and e_t >= s_t:
+                dur = round(max(0.0, e_t - s_t), 2)
         if dur is not None:
             known_sum += dur
-        st_obj = phases_status.get(ph) or {}
         out_phases.append(
             {
                 "phase": ph,
@@ -160,13 +178,12 @@ def _reconstruct_phase_timings(
             }
         )
 
+    wall_sec = round(max(0.0, (t_updated - t_created)), 2) if (t_created and t_updated and t_updated >= t_created) else 0.0
+    total_sec = round(known_sum, 2) if (known_sum > 0 and (wall_sec == 0.0 or known_sum <= wall_sec * 1.15)) else wall_sec
     denom = total_sec if total_sec > 0 else (known_sum if known_sum > 0 else 1.0)
     for item in out_phases:
         d = item["duration_sec"]
         item["pct_of_total"] = round((d / denom) * 100.0, 1) if d is not None else 0.0
-
-    if total_sec == 0.0 and known_sum > 0:
-        total_sec = round(known_sum, 2)
 
     return out_phases, total_sec, clip_render_durations
 
@@ -235,16 +252,26 @@ def _reconstruct_judge_funnel(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Build Blind Judge candidate cards (evaluated, repaired, escalated, approved, discarded)."""
     events = telemetry_events or []
-    candidates_by_title: dict[str, dict[str, Any]] = {}
+    candidates_by_key: dict[str, dict[str, Any]] = {}
+    cid_to_key: dict[str, str] = {}
+    title_to_key: dict[str, str] = {}
     order: list[str] = []
     overview: dict[str, Any] = {}
     topic_blocks: list[dict[str, Any]] = []
 
-    def _get_card(title: str, clip_type: str = "") -> dict[str, Any]:
-        key = title.strip() or "(Sin título)"
-        if key not in candidates_by_title:
-            candidates_by_title[key] = {
-                "title": key,
+    def _get_card(title: str, clip_type: str = "", candidate_id: str = "") -> dict[str, Any]:
+        cid = str(candidate_id or "").strip()
+        t_clean = str(title or "").strip() or "(Sin título)"
+        key: Optional[str] = None
+        if cid and cid in cid_to_key:
+            key = cid_to_key[cid]
+        elif t_clean in title_to_key:
+            key = title_to_key[t_clean]
+        if key is None:
+            key = cid or t_clean
+            candidates_by_key[key] = {
+                "candidate_id": cid or None,
+                "title": t_clean,
                 "clip_type": clip_type,
                 "est_sec": None,
                 "initial_eval": None,
@@ -256,9 +283,19 @@ def _reconstruct_judge_funnel(
                 "intro_curtain_text": "",
             }
             order.append(key)
-        elif clip_type and not candidates_by_title[key]["clip_type"]:
-            candidates_by_title[key]["clip_type"] = clip_type
-        return candidates_by_title[key]
+        else:
+            card_obj = candidates_by_key[key]
+            if cid and not card_obj.get("candidate_id"):
+                card_obj["candidate_id"] = cid
+            if clip_type and not card_obj["clip_type"]:
+                card_obj["clip_type"] = clip_type
+            if t_clean != "(Sin título)" and card_obj["title"] == "(Sin título)":
+                card_obj["title"] = t_clean
+        if cid:
+            cid_to_key[cid] = key
+        if t_clean != "(Sin título)":
+            title_to_key[t_clean] = key
+        return candidates_by_key[key]
 
     has_structured_editorial = any(
         ev.get("type") in ("judge_audit", "nle_repair", "candidate_outcome") for ev in events
@@ -266,6 +303,7 @@ def _reconstruct_judge_funnel(
     if has_structured_editorial:
         for ev in events:
             t = ev.get("type")
+            ev_cid = str(ev.get("candidate_id") or "")
             if t == "editorial_overview":
                 overview = {
                     "blacklisted_count": ev.get("blacklisted_count", 0),
@@ -274,7 +312,7 @@ def _reconstruct_judge_funnel(
                     "planned_angles": ev.get("planned_angles") or [],
                 }
             elif t == "judge_audit":
-                card = _get_card(str(ev.get("clip_title") or ""), str(ev.get("clip_type") or ""))
+                card = _get_card(str(ev.get("clip_title") or ""), str(ev.get("clip_type") or ""), candidate_id=ev_cid)
                 if ev.get("stage") == "initial":
                     card["initial_eval"] = ev
                 else:
@@ -282,12 +320,12 @@ def _reconstruct_judge_funnel(
                     if "strong" in str(ev.get("stage") or ""):
                         card["escalated_to_strong"] = True
             elif t == "nle_repair":
-                card = _get_card(str(ev.get("clip_title") or ""))
+                card = _get_card(str(ev.get("clip_title") or ""), candidate_id=ev_cid)
                 card["repairs"].append(ev)
                 if ev.get("tier") == "editorial_strong":
                     card["escalated_to_strong"] = True
             elif t == "candidate_outcome":
-                card = _get_card(str(ev.get("clip_title") or ""), str(ev.get("clip_type") or ""))
+                card = _get_card(str(ev.get("clip_title") or ""), str(ev.get("clip_type") or ""), candidate_id=ev_cid)
                 card["outcome"] = ev.get("audit_action") or ("approved" if ev.get("accepted") else "discarded")
                 card["outcome_detail"] = ev.get("reason") or ""
                 card["intro_curtain_text"] = ev.get("intro_curtain_text") or ""
@@ -367,13 +405,39 @@ def _reconstruct_judge_funnel(
             card["outcome_detail"] = m_dis.group(2)
             continue
 
-    # Merge any final clip outcomes (e.g., best_effort_needs_intro or fallback)
+    # Merge any final clip outcomes using candidate_id -> original_title -> final title (prevents Phase 3 title duplicates)
     for c in (job.get("clips") or []):
-        t0 = (c.get("metadata") or {}).get("titles", [None])[0] or c.get("slug") or c.get("id")
+        cid_cand = str(c.get("candidate_id") or "").strip()
+        orig_t = str(c.get("original_title") or "").strip()
+        t0 = str((c.get("metadata") or {}).get("titles", [None])[0] or c.get("slug") or c.get("id") or "")
         pkg = c.get("standalone_packaging") or {}
         act = pkg.get("audit_action") or "selected"
-        if act in ("best_effort_needs_intro", "fallback", "salvage_needs_intro") or t0 not in candidates_by_title:
-            card = _get_card(str(t0), str(c.get("clip_type") or ""))
+        existing_key = (
+            cid_to_key.get(cid_cand)
+            or title_to_key.get(orig_t)
+            or title_to_key.get(t0)
+        )
+        if existing_key is not None:
+            card = candidates_by_key[existing_key]
+            if t0 and t0 != card["title"]:
+                card["final_title"] = t0
+            if cid_cand:
+                cid_to_key[cid_cand] = existing_key
+                card["candidate_id"] = cid_cand
+            if c.get("intro_curtain_text") and not card["intro_curtain_text"]:
+                card["intro_curtain_text"] = c.get("intro_curtain_text")
+            if act in ("best_effort_needs_intro", "fallback", "salvage_needs_intro") and card["outcome"] in (
+                "unknown",
+                "rejected_with_intro",
+                "discarded",
+            ):
+                card["outcome"] = act
+                card["outcome_detail"] = pkg.get("audit_issue_fixed") or c.get("summary") or ""
+            continue
+        if act in ("best_effort_needs_intro", "fallback", "salvage_needs_intro") or True:
+            card = _get_card(orig_t or t0, str(c.get("clip_type") or ""), candidate_id=cid_cand)
+            if t0 and t0 != card["title"]:
+                card["final_title"] = t0
             if card["outcome"] in ("unknown", "rejected_with_intro", "discarded"):
                 card["outcome"] = act
                 card["outcome_detail"] = pkg.get("audit_issue_fixed") or c.get("summary") or ""
@@ -389,15 +453,21 @@ def _reconstruct_judge_funnel(
                         "what_and_context": pkg.get("what_and_context"),
                     }
 
-    cards = [candidates_by_title[k] for k in order]
+    cards = [candidates_by_key[k] for k in order]
     funnel = {
         "total_candidates_evaluated": len(cards),
         "approved_voice_only": sum(1 for x in cards if x["outcome"] == "approve"),
-        "approved_with_intro": sum(1 for x in cards if "approve" in str(x["outcome"]) and x["outcome"] != "approve"),
-        "rescued_best_effort": sum(1 for x in cards if x["outcome"] in ("best_effort_needs_intro", "fallback", "salvage_needs_intro")),
+        "approved_with_intro": sum(
+            1
+            for x in cards
+            if "needs_intro" in str(x["outcome"]) or ("approve" in str(x["outcome"]) and x["outcome"] != "approve")
+        ),
+        "rescued_best_effort": sum(
+            1 for x in cards if x["outcome"] in ("best_effort_needs_intro", "fallback", "salvage_needs_intro", "orig_needs_intro")
+        ),
         "repaired_attempts": sum(1 for x in cards if x["repairs"] or x["post_repair_evals"]),
         "escalated_strong": sum(1 for x in cards if x["escalated_to_strong"]),
-        "discarded_or_rejected": sum(1 for x in cards if x["outcome"] in ("discarded", "rejected_with_intro")),
+        "discarded_or_rejected": sum(1 for x in cards if x["outcome"] in ("discard", "discarded", "rejected_with_intro")),
         "topic_dedup_blocked": len(topic_blocks),
         "overview": overview,
         "topic_blocks": topic_blocks,
@@ -513,6 +583,34 @@ def export_job_report(
     editorial_map = json.loads(ed_map_path.read_text(encoding="utf-8")) if ed_map_path.exists() else {}
     if isinstance(editorial_map, list):
         editorial_map = {"blocks": editorial_map}
+
+    if telemetry_events is None:
+        ev_jsonl_path = proc_dir / "events.jsonl"
+        if ev_jsonl_path.exists():
+            loaded_evs: list[dict[str, Any]] = []
+            for raw_l in ev_jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                s_l = raw_l.strip()
+                if not s_l:
+                    continue
+                try:
+                    loaded_evs.append(json.loads(s_l))
+                except Exception:
+                    continue
+            if loaded_evs:
+                telemetry_events = loaded_evs
+
+    max_short_window_sec = 90.0
+    prof_id = str(job.get("profile_id") or "")
+    if prof_id:
+        prof_path = base_dir / "profiles" / prof_id / "profile.json"
+        if prof_path.exists():
+            try:
+                prof_data = json.loads(prof_path.read_text(encoding="utf-8"))
+                max_short_window_sec = float(
+                    ((prof_data.get("quotas") or {}).get("shorts_window") or {}).get("max_sec") or 90.0
+                )
+            except Exception:
+                pass
 
     phase_timings, total_duration_sec, clip_render_durs = _reconstruct_phase_timings(job, telemetry_events)
     llm_calls, llm_fallbacks = _extract_llm_telemetry(job, telemetry_events)
@@ -649,7 +747,7 @@ def export_job_report(
                     }
                 )
 
-        # Check intro curtain length (>6.2s)
+        # Check intro curtain length (>6.2s) and phrases parity
         ic_dur = float(c.get("intro_curtain_duration_sec") or 0.0)
         if c.get("intro_curtain_enabled") and ic_dur > 6.2:
             anomalies.append(
@@ -659,6 +757,38 @@ def export_job_report(
                     "code": "intro_too_long",
                     "title": f"Cortinilla IA larga ({ic_dur:.2f}s > 6.2s) en {cid}",
                     "detail": f"Texto ({len((c.get('intro_curtain_text') or '').split())} palabras): \"{c.get('intro_curtain_text')}\"",
+                }
+            )
+        if c.get("intro_curtain_enabled") and c.get("intro_curtain_phrases"):
+            norm_hook = re.sub(r"[^a-z0-9áéíóúüñ]", "", str(c.get("intro_curtain_text") or "").lower())
+            norm_ph = re.sub(
+                r"[^a-z0-9áéíóúüñ]",
+                "",
+                " ".join(str(x) for x in (c.get("intro_curtain_phrases") or [])).lower(),
+            )
+            if norm_hook and norm_ph and norm_hook != norm_ph:
+                anomalies.append(
+                    {
+                        "severity": "warning",
+                        "clip_id": cid,
+                        "code": "intro_phrases_mismatch",
+                        "title": f"Desajuste entre locución y rótulos de cortinilla en {cid}",
+                        "detail": f"Hook: \"{c.get('intro_curtain_text')}\" | Phrases: {c.get('intro_curtain_phrases')}",
+                    }
+                )
+
+        # Check Shorts exceeding max_sec window
+        edl_raw = c.get("edl") or {}
+        outro_dur_est = float(c.get("outro_curtain_duration_sec") or 0.0) if c.get("outro_curtain_enabled") else 0.0
+        total_clip_dur = (ic_dur if c.get("intro_curtain_enabled") else 0.0) + float(edl_raw.get("edited_duration") or 0.0) + outro_dur_est
+        if ctype.startswith("short") and total_clip_dur > max_short_window_sec + 0.5:
+            anomalies.append(
+                {
+                    "severity": "warning",
+                    "clip_id": cid,
+                    "code": "short_exceeds_max_sec",
+                    "title": f"Short supera el límite de {max_short_window_sec:.0f}s ({total_clip_dur:.1f}s) en {cid}",
+                    "detail": f"intro={ic_dur:.1f}s + cuerpo={float(edl_raw.get('edited_duration') or 0.0):.1f}s + cierre={outro_dur_est:.1f}s.",
                 }
             )
 

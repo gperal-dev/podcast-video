@@ -16,6 +16,7 @@ import {
   ALL_MEDIA_PROVIDERS,
   type AIImagePreviewResponse,
   type AspectRatio,
+  type ExecutionMode,
   type ImageDisplayMode,
   type ImagePriority,
   type JobState,
@@ -74,7 +75,8 @@ export function NewProductionPage({
   const [shortsConcl, setShortsConcl] = useState(currentProfile?.quotas.shorts_conclusive_count ?? 3);
   const [mediumCount, setMediumCount] = useState(currentProfile?.quotas.medium_videos_count ?? 1);
   const [longCount, setLongCount] = useState(currentProfile?.quotas.long_videos_count ?? 1);
-  const [autoMode, setAutoMode] = useState(true);
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>("auto");
+  const [pauseBeforeRender, setPauseBeforeRender] = useState(false);
   const [saveAnalyticsReport, setSaveAnalyticsReport] = useState(false);
 
   const [epImages, setEpImages] = useState<EpisodeImageDraft[]>([]);
@@ -191,7 +193,12 @@ export function NewProductionPage({
       fd.append("shorts_conclusive", String(shortsConcl));
       fd.append("medium_count", String(mediumCount));
       fd.append("long_count", String(longCount));
-      fd.append("auto_mode", String(autoMode));
+      fd.append("execution_mode", executionMode);
+      fd.append("pause_before_render", String(executionMode === "review_before_render" || pauseBeforeRender));
+      fd.append(
+        "auto_mode",
+        String(executionMode === "auto" || (executionMode === "semi_auto" && !pauseBeforeRender)),
+      );
       fd.append("save_analytics_report", String(saveAnalyticsReport));
       if (hookOverride !== "inherit") {
         fd.append("visual_hook_enabled", String(hookOverride === "on"));
@@ -944,8 +951,11 @@ export function NewProductionPage({
                 <input
                   type="radio"
                   name="exec_mode"
-                  checked={autoMode}
-                  onChange={() => setAutoMode(true)}
+                  checked={executionMode === "auto"}
+                  onChange={() => {
+                    setExecutionMode("auto");
+                    setPauseBeforeRender(false);
+                  }}
                   className="mt-1 h-4 w-4"
                 />
                 <div className="text-sm">
@@ -956,16 +966,56 @@ export function NewProductionPage({
                 </div>
               </label>
 
+              <div
+                className={`rounded-xl border p-3 transition ${
+                  executionMode === "semi_auto"
+                    ? "border-indigo-400 bg-indigo-50/40"
+                    : "border-slate-200 hover:bg-slate-50"
+                }`}
+              >
+                <label className="flex cursor-pointer items-start gap-3">
+                  <input
+                    type="radio"
+                    name="exec_mode"
+                    checked={executionMode === "semi_auto"}
+                    onChange={() => setExecutionMode("semi_auto")}
+                    className="mt-1 h-4 w-4 accent-indigo-600"
+                  />
+                  <div className="text-sm">
+                    <div className="font-semibold text-slate-900">
+                      Semiautomático — Elegir y rescatar temas tras Fase 2
+                    </div>
+                    <div className="text-xs text-slate-500">
+                      Analiza todo el episodio, te muestra recomendados, descartes rescatables y el mapa completo para que tú elijas qué producir antes de gastar tiempo en Pasada 2, stock y render.
+                    </div>
+                  </div>
+                </label>
+                {executionMode === "semi_auto" && (
+                  <label className="mt-2.5 ml-7 flex cursor-pointer items-center gap-2 rounded-lg border border-indigo-200 bg-white px-3 py-2 text-xs text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={pauseBeforeRender}
+                      onChange={(e) => setPauseBeforeRender(e.target.checked)}
+                      className="h-3.5 w-3.5 accent-indigo-600"
+                    />
+                    <span>También pausar antes de renderizar (para editar imágenes/subtítulos en Fase 4)</span>
+                  </label>
+                )}
+              </div>
+
               <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 p-3 hover:bg-slate-50">
                 <input
                   type="radio"
                   name="exec_mode"
-                  checked={!autoMode}
-                  onChange={() => setAutoMode(false)}
+                  checked={executionMode === "review_before_render"}
+                  onChange={() => {
+                    setExecutionMode("review_before_render");
+                    setPauseBeforeRender(true);
+                  }}
                   className="mt-1 h-4 w-4"
                 />
                 <div className="text-sm">
-                  <div className="font-semibold text-slate-900">Revisar antes de renderizar</div>
+                  <div className="font-semibold text-slate-900">Revisar antes de renderizar (Fase 4)</div>
                   <div className="text-xs text-slate-500">
                     Pausa tras elegir clips, audio limpio y guion visual para que puedas cambiar fotos o subtítulos.
                   </div>

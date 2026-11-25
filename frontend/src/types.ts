@@ -330,6 +330,13 @@ export interface PhaseProgress {
   status: "pending" | "running" | "completed" | "skipped" | "failed";
   progress_pct: number;
   detail: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_sec?: number | null;
+  eta_sec?: number | null;
+  substep?: string;
+  items_done?: number;
+  items_total?: number;
 }
 
 export interface ChapterMark {
@@ -387,6 +394,9 @@ export interface EDLPlan {
 
 export interface ClipCandidate {
   id: string;
+  candidate_id?: string | null;
+  original_title?: string | null;
+  user_rescued?: boolean;
   clip_type: ClipType;
   aspect_ratio: AspectRatio;
   score: number;
@@ -437,6 +447,36 @@ export interface ClipCandidate {
   render_completed: boolean;
 }
 
+export type ExecutionMode = "auto" | "semi_auto" | "review_before_render";
+
+export interface EditorialBlockItem {
+  block_index: number;
+  tema?: string;
+  resumen_breve?: string;
+  interes_general?: number;
+  start?: number;
+  end?: number;
+  is_ad_or_promo?: boolean;
+  [key: string]: unknown;
+}
+
+export interface RejectedCandidateRecord {
+  candidate_id: string;
+  title: string;
+  clip_type: ClipType;
+  score: number;
+  orig_start: number;
+  orig_end: number;
+  reason: string;
+  comprehension_score?: number | null;
+  context_clarity?: number | null;
+  clean_boundaries?: number | null;
+  resolution_score?: number | null;
+  story_interest_score?: number | null;
+  who?: string | null;
+  candidate?: ClipCandidate;
+}
+
 export interface ModelUsageRecord {
   model: string;
   calls: number;
@@ -444,6 +484,7 @@ export interface ModelUsageRecord {
   completion_tokens: number;
   total_tokens: number;
   cost_usd: number;
+  total_latency_sec?: number;
 }
 
 export interface CostMetrics {
@@ -463,6 +504,9 @@ export interface JobState {
   audio_duration_sec: number;
   detected_language: string;
   auto_mode: boolean;
+  execution_mode?: ExecutionMode;
+  pause_before_render?: boolean;
+  topics_confirmed?: boolean;
   requested_shorts_cliffhanger: number;
   requested_shorts_conclusive: number;
   requested_medium: number;
@@ -474,8 +518,19 @@ export interface JobState {
   intro_curtain_enabled?: boolean | null;
   outro_curtain_enabled?: boolean | null;
   episode_glossary?: Record<string, string>;
+  editorial_blocks?: EditorialBlockItem[];
+  candidate_pool?: ClipCandidate[];
+  rejected_candidates?: RejectedCandidateRecord[];
+  live_metrics?: Record<string, number | string>;
   license_warnings?: string[];
-  status: "queued" | "running" | "awaiting_review" | "completed" | "failed" | "cancelled";
+  status:
+    | "queued"
+    | "running"
+    | "awaiting_topic_selection"
+    | "awaiting_review"
+    | "completed"
+    | "failed"
+    | "cancelled";
   current_phase: string;
   active_step?: string;
   heartbeat_at?: string;

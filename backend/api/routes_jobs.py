@@ -17,6 +17,7 @@ from backend.core.image_gen import ai_previews_dir
 from backend.core.pipeline import JobManager
 from backend.core.profile_store import slugify
 from backend.core.watcher import AUDIO_EXTENSIONS, FolderWatcher
+from backend.models.job import ExecutionMode
 from backend.models.profile import CustomImage, DEFAULT_MEDIA_PROVIDERS, MediaProviderId
 
 
@@ -33,6 +34,16 @@ def _watcher(request: Request) -> FolderWatcher:
 
 class ReviewUpdateRequest(BaseModel):
     clips: list[dict[str, Any]]
+
+
+class SelectTopicsRequest(BaseModel):
+    selections: list[dict[str, Any]]
+    pause_before_render: Optional[bool] = None
+
+
+class ProposeBlockRequest(BaseModel):
+    block_index: int
+    clip_type: str = "short_conclusive"
 
 
 class WatcherStartRequest(BaseModel):
@@ -63,6 +74,8 @@ async def create_and_start_job(
     medium_count: Optional[int] = Form(None),
     long_count: Optional[int] = Form(None),
     auto_mode: bool = Form(True),
+    execution_mode: Optional[ExecutionMode] = Form(None),
+    pause_before_render: bool = Form(False),
     visual_hook_enabled: Optional[bool] = Form(None),
     visual_hook_style: Optional[str] = Form(None),
     allowed_media_providers: Optional[str] = Form(None),
@@ -109,6 +122,8 @@ async def create_and_start_job(
         medium_count=medium_count,
         long_count=long_count,
         auto_mode=auto_mode,
+        execution_mode=execution_mode,
+        pause_before_render=pause_before_render,
         episode_images=[],
         visual_hook_enabled=visual_hook_enabled,
         visual_hook_style=visual_hook_style,
@@ -229,6 +244,42 @@ def approve_review(request: Request, job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/jobs/{job_id}/select-topics")
+def select_topics(request: Request, job_id: str, body: SelectTopicsRequest) -> dict[str, Any]:
+    try:
+        return _jm(request).confirm_topic_selection(
+            job_id=job_id,
+            selections=body.selections,
+            pause_before_render=body.pause_before_render,
+        ).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/jobs/{job_id}/propose-block")
+def propose_block(request: Request, job_id: str, body: ProposeBlockRequest) -> dict[str, Any]:
+    try:
+        return _jm(request).propose_topic_from_block(
+            job_id=job_id,
+            block_index=body.block_index,
+            clip_type=body.clip_type,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/jobs/{job_id}/logs")
+def get_job_logs(request: Request, job_id: str) -> dict[str, Any]:
+    try:
+        return {"job_id": job_id, "events": _jm(request).get_full_logs(job_id)}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/jobs/{job_id}/events")
 async def stream_job_events(request: Request, job_id: str) -> EventSourceResponse:
     jm = _jm(request)
@@ -242,7 +293,8 @@ async def stream_job_events(request: Request, job_id: str) -> EventSourceRespons
 
     async def event_generator():
         try:
-            yield {"event": "state", "data": initial.model_dump_json()}
+            init_payload = jm._sse_state_payload(initial)
+            yield {"event": "state", "data": json.dumps(init_payload["job"])}
             while True:
                 if await request.is_disconnected():
                     break

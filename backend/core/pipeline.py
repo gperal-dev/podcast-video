@@ -7,6 +7,7 @@ import json
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -42,6 +43,8 @@ from backend.core.editorial_engine import (
     generate_final_clip_metadata,
     generate_intro_curtain_script,
     make_slug,
+    propose_clip_from_block,
+    refine_clip_glossary_from_pass2,
     run_editorial_selection,
 )
 from backend.core.openrouter_client import CostTracker, OpenRouterClient
@@ -53,6 +56,9 @@ from backend.core.subtitle_engine import (
 )
 from backend.core.transcriber import (
     apply_glossary_to_words,
+    compute_audio_draft_cache_key,
+    load_cached_draft,
+    save_cached_draft,
     transcribe_draft,
     transcribe_spans_precision,
     unload_whisper_models,
@@ -66,6 +72,7 @@ from backend.core.visual_director import generate_storyboard
 from backend.models.job import (
     ClipCandidate,
     EditableSubtitleLine,
+    ExecutionMode,
     JobState,
     PhaseName,
     PhaseProgress,
@@ -160,6 +167,7 @@ def _synthesize_curtain_tts_with_fallback(
                 settings=settings,
                 openrouter_client=llm,
                 trim_silence=True,
+                max_duration_sec=float(ic.max_sec) if ic.max_sec else None,
             )
             warn = (
                 f"Motor TTS '{ic.tts_engine}' falló ({last_err}); usado fallback '{eng}'."
@@ -230,6 +238,36 @@ class JobManager:
     def job_json_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "job.json"
 
+    def _events_jsonl_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "events.jsonl"
+
+    def _append_event(self, job_id: str, ev: dict[str, Any]) -> None:
+        try:
+            with self._save_lock:
+                epath = self._events_jsonl_path(job_id)
+                line = json.dumps(ev, ensure_ascii=False)
+                with epath.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _sse_state_payload(job: JobState) -> dict[str, Any]:
+        """Build a compact SSE snapshot omitting heavy word arrays and capping streamed logs."""
+        data = job.model_dump(mode="json")
+        for clip_d in data.get("clips") or []:
+            if isinstance(clip_d, dict):
+                clip_d["precision_words"] = []
+                clip_d["mapped_words"] = []
+        for pool_key in ("candidate_pool",):
+            for clip_d in data.get(pool_key) or []:
+                if isinstance(clip_d, dict):
+                    clip_d["precision_words"] = []
+                    clip_d["mapped_words"] = []
+        if isinstance(data.get("logs"), list) and len(data["logs"]) > 250:
+            data["logs"] = data["logs"][-250:]
+        return {"type": "state", "job": data}
+
     def episode_images_dir(self, job_id: str) -> Path:
         path = self.job_dir(job_id) / "episode_images"
         path.mkdir(parents=True, exist_ok=True)
@@ -244,7 +282,7 @@ class JobManager:
             tmp = target.with_suffix(".json.tmp")
             tmp.write_text(job.model_dump_json(indent=2), encoding="utf-8")
             tmp.replace(target)
-            payload = {"type": "state", "job": job.model_dump(mode="json")}
+            payload = self._sse_state_payload(job)
         self._notify_subscribers(job.job_id, payload)
 
     def load_job(self, job_id: str) -> JobState:
@@ -311,6 +349,8 @@ class JobManager:
         medium_count: Optional[int] = None,
         long_count: Optional[int] = None,
         auto_mode: bool = True,
+        execution_mode: Optional[ExecutionMode] = None,
+        pause_before_render: bool = False,
         episode_images: Optional[list[CustomImage]] = None,
         visual_hook_enabled: Optional[bool] = None,
         visual_hook_style: Optional[str] = None,
@@ -324,13 +364,18 @@ class JobManager:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_id = f"job_{ts}_{uuid.uuid4().hex[:6]}"
         ep_title = episode_name or source_audio_path.stem
+        resolved_mode: ExecutionMode = execution_mode or ("auto" if auto_mode else "review_before_render")
+        eff_pause_render = bool(pause_before_render) or (resolved_mode == "review_before_render")
+        eff_auto_mode = (resolved_mode == "auto") or (resolved_mode == "semi_auto" and not eff_pause_render)
 
         job = JobState(
             job_id=job_id,
             profile_id=profile.id,
             episode_name=ep_title,
             source_audio_path=str(source_audio_path.resolve()),
-            auto_mode=auto_mode,
+            auto_mode=eff_auto_mode,
+            execution_mode=resolved_mode,
+            pause_before_render=eff_pause_render,
             requested_shorts_cliffhanger=(
                 profile.quotas.shorts_cliffhanger_count if shorts_cliffhanger is None else shorts_cliffhanger
             ),
@@ -445,7 +490,7 @@ class JobManager:
             if ev:
                 ev.set()
         job = self.load_job(job_id)
-        if job.status in ("queued", "running", "awaiting_review"):
+        if job.status in ("queued", "running", "awaiting_review", "awaiting_topic_selection"):
             job.status = "cancelled"
             self._append_log(job, "Trabajo cancelado por el usuario.", level="warning")
             self._save_job(job)
@@ -513,7 +558,10 @@ class JobManager:
                         )
                         clip.intro_curtain_audio_path = tts_res["wav_path"]
                         clip.intro_curtain_duration_sec = round(
-                            max(float(profile.intro_curtain.min_sec), float(tts_res["duration_sec"]) + 0.35),
+                            min(
+                                float(profile.intro_curtain.max_sec),
+                                max(float(profile.intro_curtain.min_sec), float(tts_res["duration_sec"]) + 0.25),
+                            ),
                             3,
                         )
                         clip.intro_curtain_word_timings = tts_res["word_timings"]
@@ -695,6 +743,193 @@ class JobManager:
         self.start_job_async(job_id)
         return job
 
+    def confirm_topic_selection(
+        self,
+        job_id: str,
+        selections: list[dict[str, Any]],
+        pause_before_render: Optional[bool] = None,
+    ) -> JobState:
+        """Confirm user-picked/rescued topics after Phase 2 in Semi-Auto mode and resume Phases 3-5."""
+        job = self.load_job(job_id)
+        if job.status != "awaiting_topic_selection":
+            p2 = next((ph for ph in job.phases if ph.phase == "editorial"), None)
+            if p2 is None or p2.status != "completed":
+                raise ValueError(f"El trabajo '{job_id}' aún no está listo para seleccionar temas (estado={job.status}).")
+
+        profile = self.store.get_profile(job.profile_id)
+        if not selections:
+            raise ValueError("Debes seleccionar al menos 1 tema/clip para continuar.")
+
+        pool_by_cid: dict[str, ClipCandidate] = {}
+        pool_by_id: dict[str, ClipCandidate] = {}
+        for c in [*(job.clips or []), *(job.candidate_pool or [])]:
+            if c.candidate_id:
+                pool_by_cid[c.candidate_id] = c
+            pool_by_id[c.id] = c
+
+        rejected_by_cid: dict[str, ClipCandidate] = {}
+        for rr in (job.rejected_candidates or []):
+            cand_raw = rr.get("candidate") if isinstance(rr, dict) else None
+            if isinstance(cand_raw, dict):
+                try:
+                    rc = ClipCandidate.model_validate(cand_raw)
+                    if rc.candidate_id:
+                        rejected_by_cid[rc.candidate_id] = rc
+                    if rr.get("candidate_id"):
+                        rejected_by_cid[str(rr["candidate_id"])] = rc
+                except Exception:
+                    continue
+
+        eff_hook_default = (
+            job.visual_hook_enabled
+            if job.visual_hook_enabled is not None
+            else profile.subtitles.visual_hook_enabled
+        )
+        final_clips: list[ClipCandidate] = []
+        type_counters: dict[str, int] = {}
+
+        for sel in selections:
+            cid = str(sel.get("candidate_id") or "").strip()
+            clip_id = str(sel.get("id") or "").strip()
+            picked: Optional[ClipCandidate] = (
+                pool_by_cid.get(cid)
+                or rejected_by_cid.get(cid)
+                or pool_by_id.get(clip_id)
+            )
+            if picked is None:
+                continue
+            c_obj = picked.model_copy(deep=True)
+            if cid and cid in rejected_by_cid and cid not in pool_by_cid:
+                c_obj.user_rescued = True
+            new_type = str(sel.get("clip_type") or c_obj.clip_type).strip()
+            if new_type in ("short_cliffhanger", "short_conclusive", "medium", "long"):
+                c_obj.clip_type = new_type  # type: ignore[assignment]
+                if new_type.startswith("short"):
+                    c_obj.aspect_ratio = profile.visual.shorts_aspect
+                elif new_type == "medium":
+                    c_obj.aspect_ratio = profile.visual.medium_aspect
+                else:
+                    c_obj.aspect_ratio = profile.visual.long_aspect
+            if "intro_curtain_enabled" in sel and sel["intro_curtain_enabled"] is not None:
+                c_obj.intro_curtain_enabled = bool(sel["intro_curtain_enabled"])
+            elif c_obj.intro_curtain_enabled is None:
+                init_ic, _ = _resolve_clip_intro_curtain_enabled(
+                    job.intro_curtain_enabled,
+                    profile.intro_curtain,
+                    c_obj,
+                    visual_bible=job.visual_bible,
+                )
+                c_obj.intro_curtain_enabled = init_ic
+            if c_obj.outro_curtain_enabled is None:
+                c_obj.outro_curtain_enabled = _resolve_curtain_enabled(
+                    job.outro_curtain_enabled, profile.outro_curtain, c_obj.clip_type
+                )
+            if c_obj.intro_curtain_enabled:
+                c_obj.visual_hook_enabled = False
+            elif c_obj.visual_hook_enabled is None:
+                c_obj.visual_hook_enabled = eff_hook_default
+            custom_title = str(sel.get("title") or "").strip()
+            if custom_title:
+                if not c_obj.original_title and c_obj.metadata.titles:
+                    c_obj.original_title = c_obj.metadata.titles[0]
+                rest_titles = [t for t in (c_obj.metadata.titles or []) if t != custom_title]
+                c_obj.metadata.titles = [custom_title, *rest_titles][:3]
+
+            type_counters[c_obj.clip_type] = type_counters.get(c_obj.clip_type, 0) + 1
+            idx_num = type_counters[c_obj.clip_type]
+            c_obj.id = f"{c_obj.clip_type}_{idx_num:02d}_{make_slug(c_obj.slug or 'clip')[:16]}"
+            c_obj.enabled = True
+            # Reset downstream per-clip artifacts if re-confirming
+            c_obj.edl = None
+            c_obj.storyboard = None
+            c_obj.subtitle_lines = []
+            c_obj.ass_path = None
+            c_obj.render_completed = False
+            final_clips.append(c_obj)
+
+        if not final_clips:
+            raise ValueError("Ninguno de los candidatos seleccionados se encontró en el catálogo del episodio.")
+
+        if pause_before_render is not None:
+            job.pause_before_render = bool(pause_before_render)
+        job.auto_mode = not bool(job.pause_before_render)
+        job.topics_confirmed = True
+        job.clips = final_clips
+        job.status = "queued"
+        self._append_log(
+            job,
+            f"Selección Semiautomática confirmada ({len(final_clips)} temas elegidos, "
+            f"pausa_pre_render={'sí' if job.pause_before_render else 'no'}). Reanudando en Fase 3...",
+        )
+        self._save_job(job)
+        self.start_job_async(job_id)
+        return job
+
+    def propose_topic_from_block(
+        self,
+        job_id: str,
+        block_index: int,
+        clip_type: str = "short_conclusive",
+    ) -> dict[str, Any]:
+        """Use AI on demand to frame a ClipCandidate from a specific episode block in Semi-Auto mode."""
+        job = self.load_job(job_id)
+        profile = self.store.get_profile(job.profile_id)
+        draft_path = self.job_dir(job_id) / "draft_transcript.json"
+        if not draft_path.exists():
+            raise FileNotFoundError("No existe draft_transcript.json para este trabajo.")
+        draft_data = json.loads(draft_path.read_text(encoding="utf-8"))
+        sentences = [SentenceSegment.model_validate(s) for s in draft_data.get("sentences", [])]
+        energy_blocks = draft_data.get("energy_blocks", [])
+        silences = [tuple(x) for x in draft_data.get("silences", [])]
+
+        if clip_type not in ("short_cliffhanger", "short_conclusive", "medium", "long"):
+            clip_type = "short_conclusive"
+
+        cost_tracker = CostTracker(initial=job.cost)
+        llm = OpenRouterClient(
+            self.settings,
+            cost_tracker=cost_tracker,
+            call_log_cb=lambda m: self._append_log(job, m),
+            telemetry_cb=lambda ev: self._append_event(job_id, ev),
+        )
+        cand = propose_clip_from_block(
+            block_index=block_index,
+            clip_type=clip_type,  # type: ignore[arg-type]
+            sentences=sentences,
+            energy_blocks=energy_blocks,
+            silence_intervals=silences,  # type: ignore[arg-type]
+            profile=profile,
+            llm=llm,
+            visual_bible=job.visual_bible,
+            block_map=job.editorial_blocks,
+        )
+        job.cost = cost_tracker.snapshot()
+        job.candidate_pool.append(cand)
+        self._append_log(
+            job,
+            f"Nuevo tema propuesto desde Bloque B{block_index} ({clip_type}): '{cand.original_title or cand.slug}'.",
+        )
+        self._save_job(job)
+        return cand.model_dump(mode="json")
+
+    def get_full_logs(self, job_id: str) -> list[dict[str, Any]]:
+        """Return complete chronological event/log history from events.jsonl or job.logs fallback."""
+        epath = self._events_jsonl_path(job_id)
+        if epath.exists():
+            out: list[dict[str, Any]] = []
+            for raw in epath.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+            if out:
+                return out
+        job = self.load_job(job_id)
+        return list(job.logs or [])
+
     def _append_log(
         self,
         job: JobState,
@@ -702,6 +937,7 @@ class JobManager:
         level: str = "info",
         log_cb: Optional[Callable[[str], None]] = None,
     ) -> None:
+        is_hb = bool(message and message.startswith("[Latido]"))
         with self._save_lock:
             now_iso = datetime.now(timezone.utc).isoformat()
             entry = {
@@ -709,13 +945,18 @@ class JobManager:
                 "level": level,
                 "message": message,
             }
-            job.logs.append(entry)
-            if len(job.logs) > 600:
-                job.logs = job.logs[-600:]
+            if is_hb and job.logs and str(job.logs[-1].get("message") or "").startswith("[Latido]"):
+                job.logs[-1] = entry
+            else:
+                job.logs.append(entry)
+                if len(job.logs) > 1500:
+                    job.logs = job.logs[-1500:]
             job.heartbeat_at = now_iso
-            if message and not message.startswith("[Latido]"):
+            if message and not is_hb:
                 job.active_step = message[:160]
             self._last_activity[job.job_id] = time.monotonic()
+        if not is_hb:
+            self._append_event(job.job_id, {"type": "log", "ts": now_iso, "level": level, "message": message})
         if log_cb:
             log_cb(message)
 
@@ -726,19 +967,54 @@ class JobManager:
         status: str,
         pct: float,
         detail: str = "",
+        substep: str = "",
+        items_done: Optional[int] = None,
+        items_total: Optional[int] = None,
     ) -> None:
+        now_dt = datetime.now(timezone.utc)
+        now_iso = now_dt.isoformat()
+        clamped_pct = round(max(0.0, min(100.0, pct)), 1)
         with self._save_lock:
             job.current_phase = phase
-            job.heartbeat_at = datetime.now(timezone.utc).isoformat()
-            if detail:
-                job.active_step = detail[:160]
+            job.heartbeat_at = now_iso
+            eff_step = substep or detail
+            if eff_step:
+                job.active_step = eff_step[:160]
             self._last_activity[job.job_id] = time.monotonic()
             for ph in job.phases:
                 if ph.phase == phase:
                     ph.status = status  # type: ignore[assignment]
-                    ph.progress_pct = round(max(0.0, min(100.0, pct)), 1)
+                    ph.progress_pct = clamped_pct
                     if detail:
                         ph.detail = detail
+                    if substep:
+                        ph.substep = substep
+                    elif detail:
+                        ph.substep = detail
+                    if items_done is not None:
+                        ph.items_done = int(items_done)
+                    if items_total is not None:
+                        ph.items_total = int(items_total)
+                    if status == "running" and not ph.started_at:
+                        ph.started_at = now_iso
+                        ph.completed_at = None
+                    if status in ("completed", "failed", "skipped"):
+                        if not ph.started_at:
+                            ph.started_at = now_iso
+                        ph.completed_at = now_iso
+                    if ph.started_at:
+                        try:
+                            s_dt = datetime.fromisoformat(ph.started_at)
+                            if s_dt.tzinfo is None:
+                                s_dt = s_dt.replace(tzinfo=timezone.utc)
+                            elapsed = max(0.0, (now_dt - s_dt).total_seconds())
+                            ph.duration_sec = round(elapsed, 2)
+                            if status == "running" and 5.0 <= clamped_pct < 100.0 and elapsed >= 1.0:
+                                ph.eta_sec = round(elapsed * (100.0 - clamped_pct) / clamped_pct, 1)
+                            elif status in ("completed", "failed", "skipped"):
+                                ph.eta_sec = 0.0
+                        except Exception:
+                            pass
                     break
             weights = {
                 "transcription": 0.22,
@@ -753,21 +1029,23 @@ class JobManager:
                 p_val = 100.0 if ph.status in ("completed", "skipped") else ph.progress_pct
                 total += w * p_val
             job.overall_progress_pct = round(min(100.0, total), 1)
+        phase_ev = {
+            "type": "phase_timing",
+            "phase": phase,
+            "status": status,
+            "pct": clamped_pct,
+            "detail": detail,
+            "substep": substep or detail,
+            "ts": now_iso,
+        }
         sink = self._telemetry_sinks.get(job.job_id)
         if sink is not None:
             try:
-                sink(
-                    {
-                        "type": "phase_timing",
-                        "phase": phase,
-                        "status": status,
-                        "pct": pct,
-                        "detail": detail,
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
+                sink(phase_ev)
             except Exception:
                 pass
+        else:
+            self._append_event(job.job_id, phase_ev)
 
     def _run_heartbeat_loop(
         self,
@@ -819,14 +1097,38 @@ class JobManager:
         telemetry_events: list[dict[str, Any]] = []
         telemetry_lock = threading.Lock()
 
+        def _update_live_metrics(ev: dict[str, Any]) -> None:
+            ev_type = str(ev.get("type") or "")
+            with self._save_lock:
+                lm = dict(job.live_metrics or {})
+                lm.setdefault("judge_evaluated", 0)
+                lm.setdefault("judge_accepted", 0)
+                lm.setdefault("judge_rejected", 0)
+                lm.setdefault("llm_calls", 0)
+                lm.setdefault("llm_fallbacks", 0)
+                lm.setdefault("qa_alerts", 0)
+                if ev_type == "candidate_outcome":
+                    lm["judge_evaluated"] = int(lm["judge_evaluated"]) + 1
+                    if ev.get("accepted"):
+                        lm["judge_accepted"] = int(lm["judge_accepted"]) + 1
+                    else:
+                        lm["judge_rejected"] = int(lm["judge_rejected"]) + 1
+                elif ev_type == "llm_call":
+                    lm["llm_calls"] = int(lm["llm_calls"]) + 1
+                    if ev.get("fallback_used"):
+                        lm["llm_fallbacks"] = int(lm["llm_fallbacks"]) + 1
+                elif ev_type == "qa_alert":
+                    lm["qa_alerts"] = int(lm["qa_alerts"]) + 1
+                lm["updated_at"] = datetime.now(timezone.utc).isoformat()
+                job.live_metrics = lm
+
         def record_telemetry(ev: dict[str, Any]) -> None:
-            if not job.save_analytics_report:
-                return
+            self._append_event(job_id, ev)
+            _update_live_metrics(ev)
             with telemetry_lock:
                 telemetry_events.append(ev)
 
-        if job.save_analytics_report:
-            self._telemetry_sinks[job_id] = record_telemetry
+        self._telemetry_sinks[job_id] = record_telemetry
 
         def sync_cost() -> None:
             cost_snap = cost_tracker.snapshot()
@@ -852,7 +1154,7 @@ class JobManager:
                     cost_tracker=cost_tracker,
                     cancel_check=lambda: self._check_cancel(cancel_ev),
                     call_log_cb=_on_llm_call,
-                    telemetry_cb=record_telemetry if job.save_analytics_report else None,
+                    telemetry_cb=record_telemetry,
                 )
             return llm
 
@@ -883,6 +1185,20 @@ class JobManager:
             non_speech_intervals: list[tuple[float, float]] = []
             music_intervals: list[tuple[float, float]] = []
 
+            draft_cache_key = compute_audio_draft_cache_key(
+                src_audio,
+                language=profile.language or None,
+                remove_silences=profile.audio.remove_silences,
+                silence_threshold_db=profile.audio.silence_threshold_db,
+                min_silence_sec=profile.audio.min_silence_sec,
+                settings=self.settings,
+            )
+            cached_draft = (
+                None
+                if (p1.status == "completed" and draft_path.exists())
+                else load_cached_draft(draft_cache_key, self.settings)
+            )
+
             if p1.status == "completed" and draft_path.exists():
                 draft_data = json.loads(draft_path.read_text(encoding="utf-8"))
                 sentences = [SentenceSegment.model_validate(s) for s in draft_data["sentences"]]
@@ -895,6 +1211,34 @@ class JobManager:
                     or dict.fromkeys(s.speaker for s in sentences if s.speaker)
                 )
                 self._append_log(job, f"Checkpoint Fase 1 reutilizado ({len(sentences)} frases).", log_cb=log_cb)
+            elif cached_draft is not None and cached_draft.get("sentences"):
+                self._set_phase(job, "transcription", "running", 15.0, "Reutilizando transcripción y análisis acústico cacheados...")
+                job.audio_duration_sec = round(float(cached_draft.get("duration") or get_audio_duration(src_audio, self.settings)), 2)
+                job.detected_language = str(cached_draft.get("language") or profile.language or "es")
+                sentences = [SentenceSegment.model_validate(s) for s in cached_draft["sentences"]]
+                energy_blocks = cached_draft.get("energy_blocks", [])
+                silences = [tuple(x) for x in cached_draft.get("silences", [])]
+                non_speech_intervals = [tuple(x) for x in cached_draft.get("non_speech_intervals", [])]
+                music_intervals = [tuple(x) for x in cached_draft.get("music_intervals", [])]
+                episode_speakers = list(
+                    cached_draft.get("speakers")
+                    or dict.fromkeys(s.speaker for s in sentences if s.speaker)
+                )
+                draft_path.write_text(json.dumps(cached_draft, indent=2), encoding="utf-8")
+                sp_note = "1 voz" if len(episode_speakers) <= 1 else f"{len(episode_speakers)} hablantes detectados"
+                self._set_phase(
+                    job,
+                    "transcription",
+                    "completed",
+                    100.0,
+                    f"Caché Fase 1 reutilizada ({len(sentences)} cláusulas, {sp_note})",
+                )
+                self._append_log(
+                    job,
+                    f"Fase 1 acelerada desde caché local ({len(sentences)} cláusulas, {job.audio_duration_sec / 60:.1f} min, {sp_note}).",
+                    log_cb=log_cb,
+                )
+                self._save_job(job)
             else:
                 self._set_phase(job, "transcription", "running", 2.0, "Analizando duración y energía acústica...")
                 self._save_job(job)
@@ -965,22 +1309,21 @@ class JobManager:
                 sentences, detected_speakers = diarize_draft_sentences(src_audio, sentences, settings=self.settings)
                 episode_speakers = list(detected_speakers)
 
+                draft_payload = {
+                    "language": detected_lang,
+                    "duration": job.audio_duration_sec,
+                    "speakers": detected_speakers,
+                    "sentences": [s.model_dump() for s in sentences],
+                    "energy_blocks": energy_blocks,
+                    "silences": silences,
+                    "non_speech_intervals": non_speech_intervals,
+                    "music_intervals": music_intervals,
+                }
                 draft_path.write_text(
-                    json.dumps(
-                        {
-                            "language": detected_lang,
-                            "duration": job.audio_duration_sec,
-                            "speakers": detected_speakers,
-                            "sentences": [s.model_dump() for s in sentences],
-                            "energy_blocks": energy_blocks,
-                            "silences": silences,
-                            "non_speech_intervals": non_speech_intervals,
-                            "music_intervals": music_intervals,
-                        },
-                        indent=2,
-                    ),
+                    json.dumps(draft_payload, indent=2),
                     encoding="utf-8",
                 )
+                save_cached_draft(draft_cache_key, draft_payload, self.settings)
                 sp_note = "1 voz" if len(detected_speakers) <= 1 else f"{len(detected_speakers)} hablantes detectados"
                 self._set_phase(
                     job,
@@ -1001,7 +1344,7 @@ class JobManager:
             # ------------------------------------------------------------------
             self._check_cancel(cancel_ev)
             p2 = next(ph for ph in job.phases if ph.phase == "editorial")
-            if p2.status == "completed" and job.clips:
+            if p2.status == "completed" and (job.clips or (job.execution_mode == "semi_auto" and (job.candidate_pool or job.rejected_candidates or job.editorial_blocks))):
                 self._append_log(job, f"Checkpoint Fase 2 reutilizado ({len(job.clips)} clips).", log_cb=log_cb)
             else:
                 self._set_phase(job, "editorial", "running", 5.0, "Analizando estructura editorial y sub-ángulos con IA...")
@@ -1010,7 +1353,7 @@ class JobManager:
                 def on_ed_pct(pct: float, msg: str) -> None:
                     self._check_cancel(cancel_ev)
                     sync_cost()
-                    self._set_phase(job, "editorial", "running", pct, msg)
+                    self._set_phase(job, "editorial", "running", pct, msg, substep=msg)
                     self._save_job(job)
 
                 intro_for_shorts = _resolve_curtain_enabled(
@@ -1020,11 +1363,16 @@ class JobManager:
                     job.outro_curtain_enabled, profile.outro_curtain, "short_conclusive"
                 )
                 intro_mode = str(getattr(profile.intro_curtain, "mode", "auto_if_needed") or "auto_if_needed").lower()
-                intro_reserve = (5.0 if intro_mode == "always" else 4.5) if intro_for_shorts else 0.0
+                intro_reserve = (
+                    (min(5.2, float(profile.intro_curtain.max_sec)) if intro_mode == "always" else min(4.8, float(profile.intro_curtain.max_sec)))
+                    if intro_for_shorts
+                    else 0.0
+                )
                 outro_reserve = max(float(profile.outro_curtain.duration_sec), 5.5) if outro_for_shorts else 0.0
                 shorts_reserve = intro_reserve + outro_reserve
 
                 unified_gap_refs = merge_non_speech_with_silences(silences, non_speech_intervals)  # type: ignore[arg-type]
+                catalog_out: dict[str, Any] = {}
                 selected_clips, ed_warnings, block_map, glossary, visual_bible = run_editorial_selection(
                     sentences=sentences,
                     energy_blocks=energy_blocks,
@@ -1039,7 +1387,8 @@ class JobManager:
                     shorts_reserve_sec=shorts_reserve,
                     non_speech_intervals=unified_gap_refs,
                     log_cb=lambda m: self._append_log(job, m, log_cb=log_cb),
-                    telemetry_cb=record_telemetry if job.save_analytics_report else None,
+                    telemetry_cb=record_telemetry,
+                    catalog_out=catalog_out,
                 )
                 sync_cost()
                 for w in ed_warnings:
@@ -1049,12 +1398,16 @@ class JobManager:
 
                 job.episode_glossary = glossary
                 job.visual_bible = visual_bible
+                job.editorial_blocks = list(block_map or [])
+                job.rejected_candidates = list(catalog_out.get("rejected_candidates") or [])
                 eff_hook_default = (
                     job.visual_hook_enabled
                     if job.visual_hook_enabled is not None
                     else profile.subtitles.visual_hook_enabled
                 )
                 for c in selected_clips:
+                    if not c.original_title and c.metadata.titles:
+                        c.original_title = c.metadata.titles[0]
                     if c.intro_curtain_enabled is None:
                         init_ic, _ = _resolve_clip_intro_curtain_enabled(
                             job.intro_curtain_enabled,
@@ -1080,6 +1433,7 @@ class JobManager:
                     )
 
                 job.clips = selected_clips
+                job.candidate_pool = list(catalog_out.get("candidate_pool") or selected_clips)
                 (jdir / "editorial_map.json").write_text(
                     json.dumps(
                         {
@@ -1095,11 +1449,22 @@ class JobManager:
                 self._set_phase(job, "editorial", "completed", 100.0, f"{len(job.clips)} clips seleccionados")
                 self._append_log(
                     job,
-                    f"Fase 2 completada: {len(job.clips)} piezas elegidas | glosario={len(glossary)} términos "
-                    f"(coste acumulado: ${job.cost.cost_usd:.4f}).",
+                    f"Fase 2 completada: {len(job.clips)} piezas elegidas | {len(job.rejected_candidates)} descartes rescatables | "
+                    f"glosario={len(glossary)} términos (coste acumulado: ${job.cost.cost_usd:.4f}).",
                     log_cb=log_cb,
                 )
                 self._save_job(job)
+
+            if job.execution_mode == "semi_auto" and not job.topics_confirmed:
+                job.status = "awaiting_topic_selection"
+                self._append_log(
+                    job,
+                    f"Pausa en Modo Semiautomático: {len(job.clips)} recomendados, "
+                    f"{len(job.rejected_candidates)} descartes rescatables y {len(job.editorial_blocks)} bloques del episodio listos para tu selección.",
+                    log_cb=log_cb,
+                )
+                self._save_job(job)
+                return
 
             if not job.clips:
                 raise RuntimeError("No se pudo seleccionar ningún clip válido para este audio.")
@@ -1172,6 +1537,9 @@ class JobManager:
                         "running",
                         (idx / total_c) * 100.0,
                         f"Pasada 2 + EDL en {clip.id} ({idx + 1}/{total_c})...",
+                        substep=f"Transcribiendo Pasada 2 ({clip.id})",
+                        items_done=idx,
+                        items_total=total_c,
                     )
                     self._save_job(job)
 
@@ -1180,6 +1548,29 @@ class JobManager:
                         if clip.narrative_spans
                         else [(float(clip.orig_start), float(clip.orig_end))]
                     )
+                    last_p3_save = [0.0]
+
+                    def on_p2_pct(pct_w: float, msg_w: str) -> None:
+                        self._check_cancel(cancel_ev)
+                        overall_p3 = ((idx + (pct_w / 100.0) * 0.85) / max(1, total_c)) * 100.0
+                        self._set_phase(
+                            job,
+                            "audio_edit",
+                            "running",
+                            overall_p3,
+                            f"Pasada 2 + EDL en {clip.id} ({idx + 1}/{total_c})...",
+                            substep=f"[{clip.id}] {msg_w}",
+                            items_done=idx,
+                            items_total=total_c,
+                        )
+                        now_m = time.monotonic()
+                        if now_m - last_p3_save[0] >= 3.0:
+                            last_p3_save[0] = now_m
+                            try:
+                                self._save_job(job)
+                            except Exception:
+                                pass
+
                     words = transcribe_spans_precision(
                         src_audio,
                         spans_list,
@@ -1188,7 +1579,26 @@ class JobManager:
                         work_dir=cdir,
                         settings=self.settings,
                         reference_sentences=sentences,
+                        progress_cb=on_p2_pct,
                     )
+                    try:
+                        p2_fixes = refine_clip_glossary_from_pass2(
+                            words=words,
+                            visual_bible=job.visual_bible,
+                            existing_glossary=job.episode_glossary,
+                            llm=get_llm(),
+                        )
+                        sync_cost()
+                        if p2_fixes:
+                            job.episode_glossary = {**job.episode_glossary, **p2_fixes}
+                            self._append_log(
+                                job,
+                                f"[{clip.id}] Glosario Pasada 2 +{len(p2_fixes)} correcciones: "
+                                + ", ".join(f"{k}->{v}" for k, v in list(p2_fixes.items())[:5]),
+                                log_cb=log_cb,
+                            )
+                    except Exception:
+                        pass
                     words = apply_glossary_to_words(words, job.episode_glossary)
                     clip.precision_words = words
 
@@ -1231,7 +1641,8 @@ class JobManager:
                         else (profile.quotas.medium_window if clip.clip_type == "medium" else profile.quotas.long_window)
                     )
                     short_res_s = (
-                        (5.0 if intro_on else 0.0) + (float(cached_outro_dur) if outro_on else 0.0)
+                        (min(5.2, float(profile.intro_curtain.max_sec)) if intro_on else 0.0)
+                        + (float(cached_outro_dur) if outro_on else 0.0)
                         if clip.clip_type.startswith("short")
                         else 0.0
                     )
@@ -1248,6 +1659,7 @@ class JobManager:
                             norm = _strip_accents_lower(sentences[k].text)
                             return any(p.search(norm) for p in _PROMO_AD_PATTERNS)
 
+                        covered_bounds: list[tuple[float, float]] = [(clip.orig_start, clip.orig_end)]
                         attempts = 0
                         while (
                             s_idx is not None
@@ -1293,17 +1705,31 @@ class JobManager:
                             e_idx = next_e_idx
                             new_start = sentences[s_idx].start
                             new_end = sentences[e_idx].end
-                            if new_start < clip.orig_start or new_end > clip.orig_end:
-                                words = transcribe_spans_precision(
+                            min_cov = min(a for a, _ in covered_bounds)
+                            max_cov = max(b for _, b in covered_bounds)
+                            delta_spans: list[tuple[float, float]] = []
+                            if new_start < min_cov - 0.15:
+                                delta_spans.append((new_start, min_cov + 0.15))
+                            if new_end > max_cov + 0.15:
+                                delta_spans.append((max_cov - 0.15, new_end))
+                            if delta_spans:
+                                new_delta_words = transcribe_spans_precision(
                                     src_audio,
-                                    [(new_start, new_end)],
+                                    delta_spans,
                                     language=job.detected_language or profile.language or None,
                                     initial_prompt=proper_nouns_prompt,
                                     work_dir=cdir,
                                     settings=self.settings,
                                     reference_sentences=sentences,
                                 )
-                                words = apply_glossary_to_words(words, job.episode_glossary)
+                                new_delta_words = apply_glossary_to_words(new_delta_words, job.episode_glossary)
+                                merged_w = list(words)
+                                for nw in new_delta_words:
+                                    if not any(abs(nw.start - ew.start) < 0.08 for ew in merged_w):
+                                        merged_w.append(nw)
+                                merged_w.sort(key=lambda w: w.start)
+                                words = merged_w
+                                covered_bounds.append((new_start, new_end))
                                 clip.precision_words = words
                             spans_list = snap_spans_to_word_edges([(new_start, new_end)], words)
                             spans_list = trim_pass2_edge_orphans(spans_list, words)
@@ -1445,7 +1871,10 @@ class JobManager:
                                 self._append_log(job, f"[{clip.id}] {tts_warn}", level="warning", log_cb=log_cb)
                             clip.intro_curtain_audio_path = tts_res["wav_path"]
                             clip.intro_curtain_duration_sec = round(
-                                max(float(profile.intro_curtain.min_sec), float(tts_res["duration_sec"]) + 0.35),
+                                min(
+                                    float(profile.intro_curtain.max_sec),
+                                    max(float(profile.intro_curtain.min_sec), float(tts_res["duration_sec"]) + 0.25),
+                                ),
                                 3,
                             )
                             clip.intro_curtain_word_timings = tts_res["word_timings"]
@@ -1481,6 +1910,79 @@ class JobManager:
                         else:
                             clip.visual_hook_end_sec = 0.0
                             clip.visual_hook_spoken_text = ""
+
+                    # Enforce hard Shorts max duration cap (intro + clean body + outro <= raw_win.max_sec)
+                    if clip.clip_type.startswith("short"):
+                        eff_outro_s = float(cached_outro_dur) if outro_on else 0.0
+                        curtain_total_s = float(clip.intro_curtain_duration_sec or 0.0) + eff_outro_s
+                        total_final_est = curtain_total_s + float(edl.edited_duration)
+                        max_short_s = float(raw_win.max_sec)
+                        if total_final_est > max_short_s + 0.05 and len(mapped_words) >= 8:
+                            target_body_max = max(12.0, max_short_s - curtain_total_s - 0.35)
+                            cut_orig_end: Optional[float] = None
+                            # Prefer clean terminal punctuation boundary
+                            for mw in reversed(mapped_words):
+                                if mw.end <= target_body_max and str(mw.word or "").strip().endswith((".", "?", "!")):
+                                    cut_orig_end = float(mw.orig_end)
+                                    break
+                            if cut_orig_end is None:
+                                for mw in reversed(mapped_words):
+                                    if mw.end <= target_body_max:
+                                        cut_orig_end = float(mw.orig_end)
+                                        break
+                            if cut_orig_end is not None:
+                                trimmed_spans = [
+                                    (sp_s, min(sp_e, cut_orig_end + 0.05))
+                                    for sp_s, sp_e in spans_list
+                                    if sp_s + 1.5 < min(sp_e, cut_orig_end + 0.05)
+                                ]
+                                if trimmed_spans:
+                                    spans_list = trimmed_spans
+                                    clip.orig_start = min(s for s, _ in spans_list)
+                                    clip.orig_end = max(e for _, e in spans_list)
+                                    if clip.narrative_spans:
+                                        clip.narrative_spans = [
+                                            sp_obj.model_copy(update={"orig_start": ns, "orig_end": ne})
+                                            for sp_obj, (ns, ne) in zip(clip.narrative_spans, spans_list)
+                                        ]
+                                    edl, mapper, mapped_words = build_edl_for_spans(
+                                        clip.id,
+                                        spans_list,
+                                        words,
+                                        silences,
+                                        profile.audio,
+                                        non_speech_intervals=non_speech_intervals,
+                                        music_intervals=music_intervals,
+                                    )
+                                    render_clean_audio(
+                                        source_audio=src_audio,
+                                        edl_plan=edl,
+                                        output_wav=clean_wav,
+                                        audio_config=profile.audio,
+                                        bg_music_path=bg_music_path,
+                                        preview_mp3_path=preview_mp3,
+                                        settings=self.settings,
+                                    )
+                                    mapped_words, clip_speakers = diarize_clip_words(
+                                        clean_wav,
+                                        mapped_words,
+                                        settings=self.settings,
+                                        episode_speakers=episode_speakers,
+                                        draft_sentences=sentences,
+                                        edl_segments=edl.segments,
+                                    )
+                                    clip.edl = edl
+                                    clip.mapped_words = mapped_words
+                                    clip.speakers_detected = clip_speakers
+                                    self._append_log(
+                                        job,
+                                        f"[{clip.id}] Recorte límite Short aplicado: {total_final_est:.1f}s -> "
+                                        f"{curtain_total_s + edl.edited_duration:.1f}s (máx {max_short_s:.0f}s).",
+                                        log_cb=log_cb,
+                                    )
+
+                    if not clip.original_title and clip.metadata.titles:
+                        clip.original_title = clip.metadata.titles[0]
 
                     clip.metadata = generate_final_clip_metadata(
                         clip,
@@ -1582,6 +2084,8 @@ class JobManager:
                         clip.visual_credits_audit = []
                         clip.license_warnings = []
                         total_shots = max(1, len(sb.shots))
+                        used_lock = threading.Lock()
+                        pending_stock: list[tuple[int, Any, str, bool]] = []
                         for sh_idx, sh in enumerate(sb.shots, start=1):
                             self._check_cancel(cancel_ev)
                             if sh.source_type == "custom_image":
@@ -1616,51 +2120,96 @@ class JobManager:
                                         or bool(set(active_provs) & {"wikimedia_commons", "internet_archive"})
                                     )
                                 )
-                                with self._save_lock:
-                                    job.active_step = f"[{clip.id}] Plano {sh_idx}/{total_shots}: \"{sh.stock_query[:55]}\""
-                                    self._last_activity[job.job_id] = time.monotonic()
-                                hit = fetcher.fetch_verified_asset(
-                                    query=sh.stock_query,
-                                    aspect_ratio=clip.aspect_ratio,
-                                    prefer_type=pref,
-                                    used_ids=episode_used_ids,
-                                    forbidden_keywords=profile.visual.forbidden_stock_keywords,
-                                    spoken_context=sh.reason,
-                                    visual_bible=job.visual_bible,
-                                    llm=get_llm(),
-                                    enable_vlm=profile.visual.enable_vlm_stock_check,
-                                    allow_archive=allow_arch,
-                                    allowed_providers=active_provs,
-                                )
-                                sync_cost()
-                                if hit:
-                                    asset_id, lpath, actual_t, audit_info = hit
-                                    sh.stock_asset_id = asset_id
-                                    sh.local_media_path = str(lpath)
-                                    if actual_t.startswith("archive") or (
-                                        audit_info and audit_info.get("provider") in ("wikimedia_commons", "internet_archive")
-                                    ):
-                                        sh.source_type = "archive_media"
-                                    elif actual_t == "photo":
-                                        sh.source_type = "stock_photo"
+                                pending_stock.append((sh_idx, sh, pref, allow_arch))
+
+                        def _fetch_one_shot(item: tuple[int, Any, str, bool]) -> tuple[int, Any, Optional[tuple[Any, ...]]]:
+                            sh_i, sh_obj, pref_t, arch_ok = item
+                            self._check_cancel(cancel_ev)
+                            with used_lock:
+                                used_snap = set(episode_used_ids)
+                            hit_res = fetcher.fetch_verified_asset(
+                                query=sh_obj.stock_query,
+                                aspect_ratio=clip.aspect_ratio,
+                                prefer_type=pref_t,
+                                used_ids=used_snap,
+                                forbidden_keywords=profile.visual.forbidden_stock_keywords,
+                                spoken_context=sh_obj.reason,
+                                visual_bible=job.visual_bible,
+                                llm=get_llm(),
+                                enable_vlm=profile.visual.enable_vlm_stock_check,
+                                allow_archive=arch_ok,
+                                allowed_providers=active_provs,
+                            )
+                            return sh_i, sh_obj, hit_res
+
+                        done_shots = total_shots - len(pending_stock)
+                        if pending_stock:
+                            with ThreadPoolExecutor(max_workers=2) as pool:
+                                fut_map = {pool.submit(_fetch_one_shot, it): it for it in pending_stock}
+                                for fut in as_completed(fut_map):
+                                    self._check_cancel(cancel_ev)
+                                    sh_idx, sh, hit = fut.result()
+                                    done_shots += 1
+                                    if hit:
+                                        asset_id, lpath, actual_t, audit_info = hit
+                                        with used_lock:
+                                            if asset_id in episode_used_ids:
+                                                # Rare collision across concurrent shots: re-fetch sequentially with updated set
+                                                it_orig = fut_map[fut]
+                                                retry_hit = fetcher.fetch_verified_asset(
+                                                    query=sh.stock_query,
+                                                    aspect_ratio=clip.aspect_ratio,
+                                                    prefer_type=it_orig[2],
+                                                    used_ids=set(episode_used_ids),
+                                                    forbidden_keywords=profile.visual.forbidden_stock_keywords,
+                                                    spoken_context=sh.reason,
+                                                    visual_bible=job.visual_bible,
+                                                    llm=get_llm(),
+                                                    enable_vlm=profile.visual.enable_vlm_stock_check,
+                                                    allow_archive=it_orig[3],
+                                                    allowed_providers=active_provs,
+                                                )
+                                                if retry_hit:
+                                                    asset_id, lpath, actual_t, audit_info = retry_hit
+                                            episode_used_ids.add(asset_id)
+                                        sh.stock_asset_id = asset_id
+                                        sh.local_media_path = str(lpath)
+                                        if actual_t.startswith("archive") or (
+                                            audit_info and audit_info.get("provider") in ("wikimedia_commons", "internet_archive")
+                                        ):
+                                            sh.source_type = "archive_media"
+                                        elif actual_t == "photo":
+                                            sh.source_type = "stock_photo"
+                                        else:
+                                            sh.source_type = "stock_video"
+                                        if audit_info:
+                                            clip.visual_credits_audit.append({"shot_id": sh.id, **audit_info})
+                                        prov_name = (audit_info or {}).get("provider", actual_t)
+                                        self._append_log(
+                                            job,
+                                            f"[{clip.id}] Plano {sh_idx}/{total_shots} ({sh.source_type}): \"{sh.stock_query}\" "
+                                            f"-> {prov_name} | ${job.cost.cost_usd:.4f}",
+                                            log_cb=log_cb,
+                                        )
                                     else:
-                                        sh.source_type = "stock_video"
-                                    if audit_info:
-                                        clip.visual_credits_audit.append({"shot_id": sh.id, **audit_info})
-                                    prov_name = (audit_info or {}).get("provider", actual_t)
-                                    self._append_log(
+                                        self._append_log(
+                                            job,
+                                            f"[{clip.id}] Plano {sh_idx}/{total_shots}: sin coincidencia para \"{sh.stock_query}\" (respaldo visual).",
+                                            level="warning",
+                                            log_cb=log_cb,
+                                        )
+                                    sync_cost()
+                                    self._set_phase(
                                         job,
-                                        f"[{clip.id}] Plano {sh_idx}/{total_shots} ({sh.source_type}): \"{sh.stock_query}\" "
-                                        f"-> {prov_name} | ${job.cost.cost_usd:.4f}",
-                                        log_cb=log_cb,
+                                        "visual_direction",
+                                        "running",
+                                        ((idx + done_shots / total_shots) / max(1, total_c)) * 100.0,
+                                        f"Storyboard y stock para {clip.id} ({idx + 1}/{total_c})...",
+                                        substep=f"[{clip.id}] Plano {done_shots}/{total_shots}: \"{sh.stock_query[:45]}\"",
+                                        items_done=done_shots,
+                                        items_total=total_shots,
                                     )
-                                else:
-                                    self._append_log(
-                                        job,
-                                        f"[{clip.id}] Plano {sh_idx}/{total_shots}: sin coincidencia para \"{sh.stock_query}\" (respaldo visual).",
-                                        level="warning",
-                                        log_cb=log_cb,
-                                    )
+                                    self._save_job(job)
                         # Write per-clip license audit manifest inside processing/<job_id>/clips/<clip_id>/licencias.txt
                         lic_txt_proc = cdir / "licencias.txt"
                         _, lic_warns = write_clip_license_manifest(
@@ -1772,9 +2321,18 @@ class JobManager:
                 def on_render_pct(pct: float, msg: str) -> None:
                     self._check_cancel(cancel_ev)
                     overall_r = ((idx + pct / 100.0) / max(1, len(enabled_clips))) * 100.0
-                    self._set_phase(job, "rendering", "running", overall_r, f"[{idx + 1}/{len(enabled_clips)}] {msg}")
+                    self._set_phase(
+                        job,
+                        "rendering",
+                        "running",
+                        overall_r,
+                        f"[{idx + 1}/{len(enabled_clips)}] {msg}",
+                        substep=f"[{clip.id}] {msg}",
+                        items_done=idx,
+                        items_total=len(enabled_clips),
+                    )
                     with self._save_lock:
-                        payload = {"type": "state", "job": job.model_dump(mode="json")}
+                        payload = self._sse_state_payload(job)
                     self._notify_subscribers(job.job_id, payload)
 
                 render_final_video(

@@ -377,6 +377,47 @@ def trim_pass2_edge_orphans(
         if orig_dur < 2.2:
             continue
 
+        # 0. Trim leading pure conversational filler / short comma-hesitation fragments at clip opening
+        if span_i == 0:
+            filler_heads = {
+                "bueno", "pues", "pues bueno", "y bueno", "a ver", "ver",
+                "o sea", "bueno pues", "mira", "entonces", "es decir", "en fin",
+                "claro", "digamos", "pues eso",
+            }
+            for _pass in range(2):
+                sp_words_open = [
+                    w for w in ordered_words
+                    if (sp_s - 0.05) <= (w.start + w.end) * 0.5 <= (sp_e + 0.05)
+                ]
+                if len(sp_words_open) < 6:
+                    break
+                trimmed_open = False
+                for k_f in range(min(3, len(sp_words_open) - 3)):
+                    head_str = normalize_token(" ".join(w.word for w in sp_words_open[: k_f + 1]))
+                    last_f = sp_words_open[k_f]
+                    nxt_f = sp_words_open[k_f + 1]
+                    first_ch = next((ch for ch in sp_words_open[0].word if ch.isalpha()), "")
+                    is_short_comma_hesitation = (
+                        bool(first_ch and first_ch.islower())
+                        and last_f.word.strip().endswith(",")
+                        and (last_f.end - sp_s) <= 2.2
+                    )
+                    if (
+                        head_str in filler_heads
+                        and (
+                            last_f.word.strip().endswith((",", ".", "!", "?"))
+                            or (nxt_f.start - last_f.end) >= 0.14
+                        )
+                    ) or is_short_comma_hesitation:
+                        if (sp_e - (nxt_f.start - 0.055)) >= max(3.0, orig_dur * 0.65):
+                            sp_s = round(max(sp_s, nxt_f.start - 0.055), 4)
+                            out[span_i] = (sp_s, sp_e)
+                            orig_dur = sp_e - sp_s
+                            trimmed_open = True
+                            break
+                if not trimmed_open:
+                    break
+
         # 1. Trim leading lowercase orphan tail on this span
         sp_words = [
             w for w in ordered_words
@@ -516,7 +557,8 @@ def build_edl_for_spans(
             keep_sil_base = max(0.0, float(audio_config.keep_silence_sec))
             min_sil = max(float(audio_config.min_silence_sec), keep_sil_base + 0.06)
 
-            # Supplement with word-to-word dead gaps >= 2.0s inside the span (only if not already covered)
+            # Supplement with EVERY word-to-word dead gap >= max(1.6s, min_sil+0.3s) inside the span
+            # (speech_guards below protects all real words, so merging with unified_raw_gaps safely closes residual gaps)
             span_words = sorted(
                 (
                     w
@@ -528,13 +570,17 @@ def build_edl_for_spans(
                 key=lambda x: x.start,
             )
             extra_word_gaps: list[tuple[float, float]] = []
+            if span_words:
+                if (span_words[0].start - sp_start) >= 0.70:
+                    extra_word_gaps.append((round(sp_start, 4), round(span_words[0].start - 0.06, 4)))
+                if (sp_end - span_words[-1].end) >= 0.70:
+                    extra_word_gaps.append((round(span_words[-1].end + 0.06, 4), round(sp_end, 4)))
             for wi in range(1, len(span_words)):
                 g_s = span_words[wi - 1].end
                 g_e = span_words[wi].start
-                if (g_e - g_s) >= max(2.0, min_sil + 0.4):
-                    if not any(_intervals_overlap((g_s, g_e), ug, min_overlap=0.15) for ug in unified_raw_gaps):
-                        if not any(_intervals_overlap((g_s, g_e), cc, min_overlap=0.10) for cc in censored_cuts):
-                            extra_word_gaps.append((round(g_s + 0.04, 4), round(g_e - 0.04, 4)))
+                if (g_e - g_s) >= max(1.6, min_sil + 0.3):
+                    if not any(_intervals_overlap((g_s, g_e), cc, min_overlap=0.10) for cc in censored_cuts):
+                        extra_word_gaps.append((round(g_s + 0.04, 4), round(g_e - 0.04, 4)))
 
             cand_gaps = _merge_intervals([*unified_raw_gaps, *extra_word_gaps], gap_tolerance=0.04)
 

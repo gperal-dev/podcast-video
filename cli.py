@@ -149,6 +149,7 @@ def run_job(
     medium: Optional[int] = typer.Option(None, "--medium", help="Cantidad de vídeos medios (5-6 min)."),
     long: Optional[int] = typer.Option(None, "--long", help="Cantidad de vídeos largos (12 min)."),
     auto: bool = typer.Option(True, "--auto/--review", help="Ejecuta hasta el render final o pausa tras storyboard."),
+    mode: Optional[str] = typer.Option(None, "--mode", help="Modo de ejecución: auto | semi_auto | review."),
     visual_hook: Optional[bool] = typer.Option(None, "--visual-hook/--no-visual-hook", help="Activa o desactiva el gancho visual a pantalla completa."),
     visual_hook_style: Optional[str] = typer.Option(None, "--visual-hook-style", help="Estilo del gancho visual (kinetic_fullscreen, editorial_card, bold_minimal)."),
     media_providers: Optional[str] = typer.Option(None, "--media-providers", help="Proveedores visuales separados por coma (custom_images,pexels,pixabay,wikimedia_commons,internet_archive)."),
@@ -168,6 +169,16 @@ def run_job(
         if items:
             parsed_provs = items  # type: ignore[assignment]
 
+    eff_execution_mode: Optional[str] = None
+    if mode:
+        m_clean = mode.strip().lower()
+        if m_clean == "review":
+            m_clean = "review_before_render"
+        if m_clean not in ("auto", "semi_auto", "review_before_render"):
+            console.print(f"[red]Modo inválido: '{mode}'. Usa auto, semi_auto o review.[/red]")
+            raise typer.Exit(code=1)
+        eff_execution_mode = m_clean
+
     jm = JobManager(get_settings())
     job = jm.create_job(
         profile_id=profile,
@@ -178,13 +189,14 @@ def run_job(
         medium_count=medium,
         long_count=long,
         auto_mode=auto,
+        execution_mode=eff_execution_mode,  # type: ignore[arg-type]
         visual_hook_enabled=visual_hook,
         visual_hook_style=visual_hook_style,
         allowed_media_providers=parsed_provs,
         output_dir_override=output_dir.strip() if output_dir else None,
         save_analytics_report=save_analytics,
     )
-    console.print(f"[bold cyan]Trabajo creado:[/bold cyan] {job.job_id}")
+    console.print(f"[bold cyan]Trabajo creado:[/bold cyan] {job.job_id} (modo={job.execution_mode})")
     final_job = jm.run_job_sync(
         job.job_id,
         log_cb=lambda msg: console.print(f"  [cyan]\\[{time.strftime('%H:%M:%S')}][/cyan] {rich_escape(msg)}"),
@@ -193,6 +205,16 @@ def run_job(
     if final_job.status == "failed":
         console.print(f"[red]Error: {final_job.error_message}[/red]")
         raise typer.Exit(code=1)
+
+    if final_job.status == "awaiting_topic_selection":
+        console.print(
+            f"\n[yellow]Pausado en Modo Semiautomático ({final_job.job_id}).[/yellow]\n"
+            f"  • Recomendados IA: {len(final_job.clips)}\n"
+            f"  • Descartes rescatables: {len(final_job.rejected_candidates)}\n"
+            f"  • Bloques del episodio: {len(final_job.editorial_blocks)}\n"
+            "Selecciona los temas desde la Web (Monitor -> Selección de Temas) o POST /api/jobs/{job_id}/select-topics."
+        )
+        return
 
     if final_job.status == "awaiting_review":
         console.print(f"\n[yellow]Pausado para revisión.[/yellow] Edita desde la Web o ejecuta: [bold]python cli.py resume --job {final_job.job_id}[/bold]")

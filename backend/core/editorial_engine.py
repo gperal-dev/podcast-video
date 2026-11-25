@@ -6,6 +6,7 @@ import json
 import re
 import time
 import unicodedata
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Literal, Optional
 
@@ -48,6 +49,60 @@ def _compute_overlap_ratio(a_start: float, a_end: float, b_start: float, b_end: 
         return 0.0
     min_len = max(0.1, min(a_end - a_start, b_end - b_start))
     return inter / min_len
+
+
+_HOOK_TRAILING_DANGLING_WORDS: frozenset[str] = frozenset(
+    {
+        "de", "del", "la", "el", "los", "las", "un", "una", "unos", "unas",
+        "en", "con", "por", "para", "y", "o", "a", "al", "que", "su", "sus",
+        "pero", "mas", "sin", "e", "u",
+    }
+)
+
+_ORPHAN_START_WORDS: frozenset[str] = frozenset(
+    {
+        "de", "del", "que", "y", "e", "o", "u", "pero", "porque", "como", "al",
+        "para", "con", "sin", "por", "sino", "ni", "aunque", "donde", "cuando",
+        "mientras", "entonces", "asi", "pues",
+    }
+)
+
+
+def _clean_trailing_hook_words(text: str) -> str:
+    """Ensure short screen hooks never end mid-phrase on a hanging Spanish article/preposition."""
+    words = (text or "").strip().split()
+    while len(words) > 2:
+        norm = _strip_accents_lower(re.sub(r"[^\wáéíóúüñ]", "", words[-1]))
+        if norm in _HOOK_TRAILING_DANGLING_WORDS:
+            words.pop()
+        else:
+            break
+    return " ".join(words).rstrip(",;:")
+
+
+def _trim_intro_cleanly(text: str, max_words: int = 26) -> str:
+    """Trim an AI intro script cleanly on sentence bounds or without dangling trailing words."""
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return ""
+    words = cleaned.split()
+    if len(words) > max_words:
+        chosen: Optional[str] = None
+        for idx in range(max_words - 1, 8, -1):
+            if words[idx].rstrip("\"'”’").endswith((".", "!", "?")):
+                chosen = " ".join(words[: idx + 1])
+                break
+        if chosen is None:
+            chosen = " ".join(words[:max_words]).rstrip(",;:")
+        cleaned = chosen
+    cleaned = cleaned.rstrip(",;:")
+    if not cleaned.endswith((".", "!", "?")):
+        cleaned = _clean_trailing_hook_words(cleaned) or cleaned
+    if cleaned.startswith("¿") and not cleaned.endswith("?"):
+        cleaned += "?"
+    elif not cleaned.endswith((".", "!", "?")):
+        cleaned += "."
+    return cleaned
 
 
 def _format_sentences_block(
@@ -915,6 +970,19 @@ def _normalize_score(raw_val: Any, default: int = 78) -> int:
     return max(40, min(98, int(round(val))))
 
 
+def _phrase_exists_in_tokens(phrase_parts: list[str], stream_tokens: list[str]) -> bool:
+    """Return True if normalized phrase_parts appear consecutively inside stream_tokens."""
+    k = len(phrase_parts)
+    if k == 0 or k > len(stream_tokens):
+        return False
+    first = phrase_parts[0]
+    limit = len(stream_tokens) - k + 1
+    for i in range(limit):
+        if stream_tokens[i] == first and stream_tokens[i : i + k] == phrase_parts:
+            return True
+    return False
+
+
 def extract_episode_glossary_and_bible(
     sentences: list[SentenceSegment],
     block_map: list[dict[str, Any]],
@@ -922,36 +990,42 @@ def extract_episode_glossary_and_bible(
     llm: OpenRouterClient,
     blacklisted_indices: Optional[set[int]] = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
-    """Extract episode proper nouns glossary (to fix Whisper mishearings) and Visual Bible, ignoring ad/promo segments."""
+    """Extract grounded episode proper nouns glossary and Visual Bible, ignoring ad/promo segments."""
     blocked = blacklisted_indices or set()
     clean_sents = [s for i, s in enumerate(sentences) if i not in blocked]
     if not clean_sents:
         clean_sents = list(sentences)
 
-    if len(clean_sents) <= 130:
+    if len(clean_sents) <= 180:
         sample_sents = clean_sents
     else:
-        # Evenly sample ~120 sentences across opening, quartiles, middle, and ending so mid-episode distortions are caught
-        target_n = 120
+        # Evenly sample ~180 sentences across opening, quartiles, middle, and ending so mid-episode distortions are caught
+        target_n = 180
         step = (len(clean_sents) - 1) / float(target_n - 1)
         idxs = sorted({min(len(clean_sents) - 1, int(round(k * step))) for k in range(target_n)})
         sample_sents = [clean_sents[i] for i in idxs]
 
+    # Build full normalized token stream across all episode sentences for strict grounding verification
+    all_episode_tokens: list[str] = []
+    for sent in clean_sents:
+        all_episode_tokens.extend(_normalize_glossary_token(sent.text).split())
+
     clean_blocks = [m for m in block_map if not m.get("is_ad_or_promo")] or block_map
     map_summary = "\n".join(
         f"- Bloque {m.get('block_index')}: {m.get('tema', '')} ({m.get('resumen_breve', '')})"
-        for m in clean_blocks[:25]
+        for m in clean_blocks[:32]
     )
 
     sys_prompt = (
         "Eres lingüista forense, historiador/especialista de dominio y director creativo de documentales. "
         "Tu misión doble es:\n"
         "1. Detectar nombres propios reales, siglas, lugares, modelos y términos técnicos mal transcritos fonéticamente por Whisper "
-        "(ej. 'Speedfile'/'fridge' -> 'Spitfire', 'Rorro y Merlin' -> 'Rolls-Royce Merlin', 'Beatriz Silling' -> 'Beatrice Shilling', 'RIA' -> 'RAE') "
+        "en ESTE episodio concreto (cuando el ASR escribe fonéticamente un nombre real o término extranjero/técnico) "
         "y construir un glosario limpio de corrección.\n"
-        "2. Definir la Biblia Visual y la columna vertebral narrativa ('narrative_spine') del episodio.\n\n"
+        "2. Definir la Biblia Visual y la columna vertebral narrativa ('narrative_spine') de ESTE episodio.\n\n"
         "REGLAS CRÍTICAS ANTI-ALUCINACIÓN:\n"
-        "- NUNCA inventes ni sustituyas un nombre propio por otro personaje histórico diferente si no estás 100% seguro de que el audio se refiere a él.\n"
+        "- Cada clave de 'glossary' DEBE aparecer LITERALMENTE en la transcripción proporcionada abajo.\n"
+        "- PROHIBIDO inventar términos, copiar ejemplos externos o añadir personajes/lugares que no pertenezcan a este episodio.\n"
         "- SOLO incluye en 'glossary' distorsiones fonéticas claras de 1 a 5 palabras cuyo término real aparezca o sea inequívocamente aludido en el episodio.\n"
         "- PROHIBIDO incluir palabras comunes del español o frases explicativas largas en 'glossary'.\n"
         "- IGNORA por completo anuncios, autopromociones de otros episodios o menciones a plataformas.\n"
@@ -965,36 +1039,40 @@ def extract_episode_glossary_and_bible(
         "Devuelve JSON exactamente con:\n"
         "{\n"
         '  "episode_topic": "Tema central del episodio en 1 frase clara con protagonista/tema y ámbito",\n'
-        '  "era_or_setting": "Época exacta, ámbito o escenario real (ej. Segunda Guerra Mundial 1939-1945, aviación británica)",\n'
+        '  "era_or_setting": "Época exacta, ámbito o escenario real de este episodio",\n'
         '  "niche_category": "historia | tecnologia | negocios | ciencia | cultura | actualidad | entrevista | otro",\n'
         '  "narrative_spine": "Resumen de 2-3 frases explicando el hilo conductor completo del episodio (contexto inicial -> conflicto/desarrollo -> desenlace)",\n'
-        '  "proper_nouns": ["Lista de hasta 20 nombres propios, lugares, máquinas o términos técnicos reales del tema central (sin anuncios)"],\n'
-        '  "glossary": {"forma_erronea_corta": "nombre_propio_o_termino_correcto"} (SOLO 1-5 palabras por clave y 1-6 por valor),\n'
+        '  "proper_nouns": ["Lista de hasta 20 nombres propios, lugares, máquinas o términos técnicos reales del tema central de este episodio (sin anuncios)"],\n'
+        '  "glossary": {"texto_erroneo_literal_del_transcript": "forma_correcta_real"} (SOLO 1-5 palabras por clave, LITERALES del transcript, y 1-6 por valor),\n'
         '  "visual_bible": {\n'
-        '    "visual_style": "Descripción visual en inglés para guiar las búsquedas (ej. dark moody vintage WWII aviation documentary)",\n'
+        '    "visual_style": "Descripción visual en inglés para guiar las búsquedas acorde al episodio",\n'
         '    "prefer_historical_archive": true/false (true solo si el tema es histórico/documental clásico de dominio público),\n'
-        '    "forbidden_anachronisms": ["elementos visuales prohibidos en inglés, ej: modern skyscrapers, smartphones, modern jet airliner, sci-fi"],\n'
+        '    "forbidden_anachronisms": ["elementos visuales prohibidos en inglés incoherentes con la época/tema"],\n'
         '    "concrete_filmable_motifs": ["6-8 objetos o escenas reales y filmables en inglés de 2-5 palabras cada una, coherentes con el episodio"],\n'
-        '    "fallback_query": "Query limpia, concreta y filmable en inglés de 2 a 4 palabras (ej. vintage aircraft workshop; NUNCA frases abstractas ni podcast microphone salvo que trate de grabar podcasts)"\n'
+        '    "fallback_query": "Query limpia, concreta y filmable en inglés de 2 a 4 palabras acorde al tema"\n'
         "  }\n"
         "}"
     )
 
     try:
-        resp = llm.chat_json("editorial", sys_prompt, usr_prompt, temperature=0.15, max_tokens=2600)
+        resp = llm.chat_json("editorial", sys_prompt, usr_prompt, temperature=0.1, max_tokens=2600, stage="glossary_and_bible")
         raw_gloss = resp.get("glossary") or {}
         glossary: dict[str, str] = {}
         for k, v in raw_gloss.items():
             k_clean = " ".join(str(k).strip().split())
             v_clean = " ".join(str(v).strip().split())
+            k_parts = _normalize_glossary_token(k_clean).split()
             if (
                 k_clean
                 and v_clean
+                and k_parts
                 and k_clean.lower() != v_clean.lower()
+                and _normalize_glossary_token(k_clean) != _normalize_glossary_token(v_clean)
                 and len(k_clean) <= 48
                 and len(v_clean) <= 56
-                and len(k_clean.split()) <= 5
+                and len(k_parts) <= 5
                 and len(v_clean.split()) <= 6
+                and _phrase_exists_in_tokens(k_parts, all_episode_tokens)
             ):
                 glossary[k_clean] = v_clean
         bible = resp.get("visual_bible") or {}
@@ -1044,6 +1122,72 @@ def extract_episode_glossary_and_bible(
         }
 
 
+def refine_clip_glossary_from_pass2(
+    words: list[WordTimestamp],
+    visual_bible: Optional[dict[str, Any]],
+    existing_glossary: Optional[dict[str, str]],
+    llm: Optional[OpenRouterClient],
+) -> dict[str, str]:
+    """Detect residual Pass-2 ASR phonetic distortions on proper nouns/terms inside a single clip (grounded)."""
+    if not words or llm is None:
+        return {}
+    vb = visual_bible or {}
+    proper_nouns = [str(x).strip() for x in (vb.get("proper_nouns") or []) if str(x).strip()][:16]
+    clip_tokens: list[str] = []
+    for w in words:
+        clip_tokens.extend(_normalize_glossary_token(w.word).split())
+    if len(clip_tokens) < 6:
+        return {}
+
+    raw_text = " ".join(w.word.strip() for w in words if w.word.strip())
+    if len(raw_text) > 4500:
+        raw_text = raw_text[:4500]
+
+    sys_prompt = (
+        "Eres corrector ortográfico forense para subtítulos de vídeo en español.\n"
+        "Detecta ÚNICAMENTE erratas fonéticas evidentes de Whisper en nombres propios, lugares, siglas o expresiones mal oídas "
+        "dentro del texto literal de abajo.\n"
+        "REGLAS ESTRICTAS:\n"
+        "- Cada clave del JSON 'fixes' DEBE aparecer literalmente en el texto proporcionado.\n"
+        "- NO cambies palabras comunes bien escritas, NO inventes sinónimos ni cambies el sentido.\n"
+        "- Si no hay erratas claras, devuelve {\"fixes\": {}}.\n"
+        "Responde SOLO JSON válido: {\"fixes\": {\"errata_literal\": \"forma_correcta\"}}."
+    )
+    usr_prompt = (
+        f"Tema del episodio: {vb.get('episode_topic', '')}\n"
+        f"Época/Ámbito: {vb.get('era_or_setting', '')}\n"
+        f"Nombres propios conocidos: {', '.join(proper_nouns) if proper_nouns else 'No especificados'}\n"
+        f"Glosario previo: {json.dumps(existing_glossary or {}, ensure_ascii=False)}\n\n"
+        f"TEXTO LITERAL DEL CLIP (PASADA 2):\n{raw_text}"
+    )
+    try:
+        resp = llm.chat_json("fast", sys_prompt, usr_prompt, temperature=0.05, max_tokens=700, stage="pass2_glossary")
+    except Exception:
+        return {}
+
+    raw_fixes = resp.get("fixes") or resp.get("glossary") or {}
+    if not isinstance(raw_fixes, dict):
+        return {}
+    grounded: dict[str, str] = {}
+    for k, v in raw_fixes.items():
+        k_clean = " ".join(str(k).strip().split())
+        v_clean = " ".join(str(v).strip().split())
+        k_parts = _normalize_glossary_token(k_clean).split()
+        if (
+            k_clean
+            and v_clean
+            and k_parts
+            and _normalize_glossary_token(k_clean) != _normalize_glossary_token(v_clean)
+            and 1 <= len(k_parts) <= 5
+            and 1 <= len(v_clean.split()) <= 6
+            and len(k_clean) <= 48
+            and len(v_clean) <= 56
+            and _phrase_exists_in_tokens(k_parts, clip_tokens)
+        ):
+            grounded[k_clean] = v_clean
+    return grounded
+
+
 def apply_glossary_to_sentences(
     sentences: list[SentenceSegment],
     glossary: dict[str, str],
@@ -1091,6 +1235,10 @@ def apply_glossary_to_sentences(
                     trail_m = re.search(r'([.,;:!?)"\']+)$', tokens[i + k - 1])
                     trail = trail_m.group(1) if trail_m else ""
                     rep_words = right_phrase.split()
+                    if out_toks and len(rep_words) >= 2:
+                        prev_norm = _normalize_glossary_token(out_toks[-1])
+                        if prev_norm and _normalize_glossary_token(rep_words[0]) == prev_norm:
+                            rep_words = rep_words[1:]
                     if rep_words:
                         if lead and not rep_words[0].startswith(lead):
                             rep_words[0] = lead + rep_words[0]
@@ -1151,7 +1299,7 @@ def _map_single_block_batch(
         "- resumen_breve (1-2 frases precisas indicando nombres, hechos y si la historia cierra dentro del bloque o sigue después)\n\n"
         + "\n\n".join(blocks_text)
     )
-    resp = llm.chat_json("fast", sys_prompt, usr_prompt, temperature=0.15, max_tokens=3200)
+    resp = llm.chat_json("fast", sys_prompt, usr_prompt, temperature=0.15, max_tokens=3200, stage="map_blocks")
     items = resp.get("blocks") or resp.get("items") or []
     return [x for x in items if isinstance(x, dict)]
 
@@ -1311,8 +1459,28 @@ def _build_candidate_from_spans(
     if not spans_idx:
         return None
 
+    blk = blacklisted_indices or set()
+    snapped_spans_idx: list[tuple[int, int, str]] = []
+    last_sp_k = len(spans_idx) - 1
+    for sp_k, (si, ei, role) in enumerate(spans_idx):
+        prev_ei = snapped_spans_idx[-1][1] if snapped_spans_idx else -1
+        next_si = spans_idx[sp_k + 1][0] if sp_k < last_sp_k else len(sentences)
+        if sp_k == 0 and si > 0 and (si - 1) not in blk and (si - 1) > prev_ei:
+            cur_txt = sentences[si].text
+            first_norm = _strip_accents_lower(re.sub(r"[^\wáéíóúüñ]", "", (cur_txt.split() or [""])[0]))
+            if (
+                _starts_with_lowercase(cur_txt)
+                and first_norm in _ORPHAN_START_WORDS
+                and (float(sentences[si].start) - float(sentences[si - 1].end)) < 0.35
+            ):
+                si -= 1
+        if sp_k == last_sp_k and ei + 1 < len(sentences) and (ei + 1) not in blk and (ei + 1) < next_si:
+            if _norm_last_word(sentences[ei].text) in DANGLING_END_WORDS:
+                ei += 1
+        snapped_spans_idx.append((si, ei, role))
+
     adj_spans, est_dur = _adjust_multispan_to_window(
-        spans_idx,
+        snapped_spans_idx,
         sentences,
         target_window,
         silence_intervals,
@@ -1386,6 +1554,7 @@ def _build_candidate_from_spans(
     hook_words = hook_raw.split()
     if len(hook_words) > 9:
         hook_raw = " ".join(hook_words[:8])
+    hook_raw = _clean_trailing_hook_words(hook_raw)
 
     meta = ClipMetadata(
         titles=titles,
@@ -1407,10 +1576,20 @@ def _build_candidate_from_spans(
             if sentences[k].speaker
         )
     )
-    packaging = raw.get("standalone_packaging") if isinstance(raw.get("standalone_packaging"), dict) else {}
+    packaging = dict(raw.get("standalone_packaging")) if isinstance(raw.get("standalone_packaging"), dict) else {}
+    raw_outline = raw.get("video_outline")
+    if isinstance(raw_outline, list):
+        cleaned_outline = [str(x).strip() for x in raw_outline if str(x).strip()][:6]
+        if cleaned_outline:
+            packaging["video_outline"] = cleaned_outline
+
+    cand_uid = str(raw.get("candidate_id") or f"cand_{uuid.uuid4().hex[:8]}").strip()
+    orig_title = str(raw.get("original_title") or titles[0]).strip()
 
     return ClipCandidate(
         id=f"{clip_type}_{idx_counter:02d}_{slug[:16]}",
+        candidate_id=cand_uid,
+        original_title=orig_title,
         clip_type=clip_type,
         aspect_ratio=aspect_ratio,  # type: ignore[arg-type]
         score=final_score,
@@ -1728,7 +1907,7 @@ def _run_cold_viewer_test(
         "- 1-3: Ininteligible, anuncio puro o corte totalmente roto.\n\n"
         "Responde JSON exactamente con:\n"
         "{\n"
-        '  "who": "Nombre o identidad concreta del protagonista/objeto según el texto literal (DESCONOCIDO si no se nombra)",\n'
+        '  "who": "Protagonista, personaje, ejército, país, institución o grupo concreto del texto literal (p. ej. \'Rommel y el ejército británico\', \'los aliados\'; solo escribe DESCONOCIDO si realmente no se nombra ningún actor ni bando)",\n'
         '  "what_and_context": "Qué ocurre, cuándo/dónde y por qué importa según el texto literal (DESCONOCIDO si falta)",\n'
         '  "opening_4_6s_clear": true/false,\n'
         '  "opening_issue": "Motivo concreto si los primeros 4-6s empiezan con pronombre huérfano, muletilla o sin sujeto claro",\n'
@@ -1744,17 +1923,25 @@ def _run_cold_viewer_test(
         '  "missing_context_items": ["dato concreto faltante 1"],\n'
         '  "edit_operations": ["lista de operaciones recomendadas: trim_start | trim_end | extend_end_to_payoff | prune_digression | add_context_intro_span | reorder_cold_open_hook | add_ai_intro_curtain | fix_splice"],\n'
         '  "director_instructions": "Instrucción concreta de montaje NLE para dejar el vídeo autónomo y perfecto (qué recortar, extender, podar o enmarcar con intro IA)",\n'
-        '  "comprehension_score": 1-10,\n'
+        '  "comprehension_score": 1-10 (qué tan bien se entiende la historia central del fragmento, aunque le falte presentar contexto previo),\n'
+        '  "story_interest_score": 1-10 (atractivo narrativo, emoción, giro o valor de entretenimiento del relato en sí),\n'
         '  "hook_strength": 1-10,\n'
-        '  "context_clarity": 1-10,\n'
+        '  "context_clarity": 1-10 (solo de los primeros 4-6 segundos + presentación inicial),\n'
         '  "clean_boundaries": 1-10,\n'
-        '  "resolution_score": 1-10,\n'
+        '  "resolution_score": 1-10 (si el tramo concluye bien su idea o deja la intriga en el punto exacto),\n'
         '  "standalone_summary": "1 frase describiendo SOLO lo que se entiende de este texto literal"\n'
         "}"
     )
 
     try:
-        resp = llm.chat_json(model_role, sys_prompt, usr_prompt, temperature=0.1, max_tokens=1200)
+        resp = llm.chat_json(
+            model_role,
+            sys_prompt,
+            usr_prompt,
+            temperature=0.1,
+            max_tokens=1200,
+            stage="cold_viewer_with_intro" if include_intro_curtain else "cold_viewer",
+        )
     except Exception as exc:
         return {
             "who": "DESCONOCIDO",
@@ -1774,10 +1961,12 @@ def _run_cold_viewer_test(
             "edit_operations": ["add_ai_intro_curtain"],
             "director_instructions": "",
             "comprehension_score": 40,
+            "story_interest_score": 50,
             "hook_strength": 40,
             "context_clarity": 40,
             "clean_boundaries": 40,
             "resolution_score": 40,
+            "raw_resolution_score": 40,
             "standalone_summary": cand.summary,
             "who_unknown": True,
             "what_unknown": True,
@@ -1793,10 +1982,12 @@ def _run_cold_viewer_test(
     what_unknown = _is_unknown_or_vague(what_ctx)
 
     comp_sc = _normalize_score(resp.get("comprehension_score"), default=60)
+    interest_sc = _normalize_score(resp.get("story_interest_score"), default=max(60, comp_sc))
     hook_sc = _normalize_score(resp.get("hook_strength"), default=60)
     ctx_sc = _normalize_score(resp.get("context_clarity"), default=60)
     bnd_sc = _normalize_score(resp.get("clean_boundaries"), default=60)
     res_sc = _normalize_score(resp.get("resolution_score"), default=60)
+    raw_res_sc = res_sc
 
     clean_start = bool(resp.get("clean_start", True))
     clean_end = bool(resp.get("clean_end", True))
@@ -1826,17 +2017,20 @@ def _run_cold_viewer_test(
         if sp_si is not None:
             st_txt = sentences[sp_si].text
             prev_txt = sentences[sp_si - 1].text if sp_si > 0 else ""
+            first_word_norm = _strip_accents_lower(re.sub(r"[^\wáéíóúüñ]", "", (st_txt.split() or [""])[0]))
             tight_prev_gap = (
                 sp_si > 0
                 and (sentences[sp_si].start - sentences[sp_si - 1].end) < 0.35
                 and (_norm_last_word(prev_txt) in DANGLING_END_WORDS or prev_txt.rstrip().endswith((",", ";", ":")))
             )
             bad_start = _is_dead_opening(st_txt, "") or (
-                _starts_with_lowercase(st_txt) and tight_prev_gap
+                _starts_with_lowercase(st_txt)
+                and tight_prev_gap
+                and first_word_norm in _ORPHAN_START_WORDS
             )
             if bad_start:
                 if sp_i == 0:
-                    if has_intro_curtain and not _is_dead_opening(st_txt, "") and not tight_prev_gap:
+                    if has_intro_curtain and not _is_dead_opening(st_txt, ""):
                         pass
                     else:
                         clean_start = False
@@ -1846,15 +2040,9 @@ def _run_cold_viewer_test(
                     broken_splices.append(f"Empalme #{sp_i} arranca con fragmento incompleto/muletilla: '{st_txt[:45]}'")
         if sp_ei is not None:
             en_txt = sentences[sp_ei].text.strip()
-            tight_next_comma = (
-                en_txt.endswith((",", ";", ":"))
-                and sp_ei + 1 < len(sentences)
-                and _starts_with_lowercase(sentences[sp_ei + 1].text)
-                and (sentences[sp_ei + 1].start - sentences[sp_ei].end) < 0.35
-            )
             # Whisper draft transcripts frequently omit periods on complete spoken thoughts;
-            # only force bad_end when ending on a dangling function word or mid-comma continuation.
-            bad_end = (_norm_last_word(en_txt) in DANGLING_END_WORDS) or tight_next_comma
+            # only force bad_end when ending on a dangling function word.
+            bad_end = _norm_last_word(en_txt) in DANGLING_END_WORDS
             if bad_end:
                 if sp_i == len(spans_check) - 1:
                     clean_end = False
@@ -1883,6 +2071,21 @@ def _run_cold_viewer_test(
     if not has_intro_curtain:
         if _opening_needs_context_bridge(opening_22, visual_bible):
             opening_4_6s_clear = False
+    elif who_unknown and (not what_unknown) and len(what_ctx) >= 40:
+        vb_entities = [
+            str(e).strip()
+            for e in ((visual_bible or {}).get("proper_nouns") or (visual_bible or {}).get("key_entities") or [])
+            if str(e).strip()
+        ]
+        what_low = _strip_accents_lower(what_ctx)
+        named_hits = [e for e in vb_entities if _strip_accents_lower(e) in what_low]
+        if not named_hits:
+            cap_hits = re.findall(r"(?<=[a-z0-9,;:\)]\s)([A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]{2,})", what_ctx)
+            if len(cap_hits) >= 2:
+                named_hits = list(dict.fromkeys(cap_hits[:3]))
+        if named_hits:
+            who = ", ".join(named_hits[:3])
+            who_unknown = False
 
     if who_unknown or what_unknown:
         ctx_sc = min(ctx_sc, 45)
@@ -1912,16 +2115,18 @@ def _run_cold_viewer_test(
         and resolution_answered
     )
     passed_with_intro_only = bool(
-        (bnd_sc >= 55 or (not hard_bad_start and clean_end and splices_coherent and not broken_splices))
-        and res_sc >= 60
-        and (not hard_bad_start)
+        bnd_sc >= 65
+        and res_sc >= 70
+        and not who_unknown
+        and not what_unknown
+        and clean_start
         and clean_end
         and splices_coherent
         and not broken_splices
+        and not orphan_or_meta
         and not has_spoiler
-        and not meta_hit
         and resolution_answered
-        and comp_sc >= 40
+        and comp_sc >= 60
     )
     needs_ai_intro = bool(
         (not opening_4_6s_clear)
@@ -1951,10 +2156,12 @@ def _run_cold_viewer_test(
         "edit_operations": edit_ops,
         "director_instructions": str(resp.get("director_instructions") or "").strip(),
         "comprehension_score": comp_sc,
+        "story_interest_score": interest_sc,
         "hook_strength": hook_sc,
         "context_clarity": ctx_sc,
         "clean_boundaries": bnd_sc,
         "resolution_score": res_sc,
+        "raw_resolution_score": raw_res_sc,
         "standalone_summary": str(resp.get("standalone_summary") or cand.summary).strip(),
         "who_unknown": who_unknown,
         "what_unknown": what_unknown,
@@ -2108,6 +2315,14 @@ def _request_editorial_repair(
     ops_str = ", ".join(cold_eval.get("edit_operations") or []) or "Ajustar montaje"
     dir_instr = str(cold_eval.get("director_instructions") or "").strip() or "Mejorar contexto inicial, continuidad y cierre"
     format_label = "vídeo vertical corto (9:16)" if is_short else f"vídeo {cand.clip_type} ({cand.aspect_ratio})"
+    outline_items = [str(x).strip() for x in ((cand.standalone_packaging or {}).get("video_outline") or []) if str(x).strip()]
+    outline_block = (
+        "\nMINI-ÍNDICE OBLIGATORIO DEL SUBTEMA DE ESTE VÍDEO:\n"
+        + "\n".join(f"  {idx + 1}. {item}" for idx, item in enumerate(outline_items))
+        + "\n- Verifica que el montaje cubra todos estos puntos del subtema (poda relleno secundario con `drop_sentence_ids` si hace falta espacio, pero NO omitas el hecho/hito central).\n"
+        if outline_items
+        else ""
+    )
 
     sys_prompt = (
         "Eres un Editor de Vídeo NLE Profesional y Showrunner de documentales y reels virales (estilo Premiere/DaVinci). "
@@ -2130,7 +2345,8 @@ def _request_editorial_repair(
         f"- Spoiler detectado (cliffhanger): {cold_eval.get('has_spoiler', False)}\n"
         f"- Operaciones sugeridas: {ops_str}\n"
         f"- Instrucción del Director: {dir_instr}\n"
-        f"- Inicio limpio={cold_eval.get('clean_start')} | Final limpio={cold_eval.get('clean_end')} | Empalmes coherentes={cold_eval.get('splices_coherent', True)} | Resolución={cold_eval.get('resolution_answered')}\n\n"
+        f"- Inicio limpio={cold_eval.get('clean_start')} | Final limpio={cold_eval.get('clean_end')} | Empalmes coherentes={cold_eval.get('splices_coherent', True)} | Resolución={cold_eval.get('resolution_answered')}\n"
+        f"{outline_block}\n"
         f"TRAMOS ACTUALES DEL CANDIDATO:\n{cur_script}\n\n"
         f"{repair_ctx}\n\n"
         "CAJA DE HERRAMIENTAS DE EDICIÓN PROFESIONAL (APLICA LAS QUE NECESITES):\n"
@@ -2156,9 +2372,54 @@ def _request_editorial_repair(
     )
 
     try:
-        return llm.chat_json(model_role, sys_prompt, usr_prompt, temperature=0.15, max_tokens=2200)
+        return llm.chat_json(model_role, sys_prompt, usr_prompt, temperature=0.15, max_tokens=2200, stage=f"nle_repair_{model_role}")
     except Exception as exc:
         return {"action": "reject", "issue": f"Error en reparación ({model_role}): {exc}", "refined_spans": []}
+
+
+def _check_outline_coverage(
+    cand: ClipCandidate,
+    sentences: list[SentenceSegment],
+    id_to_idx: dict[str, int],
+    llm: OpenRouterClient,
+    show_speakers: bool = False,
+) -> dict[str, Any]:
+    """Verify that the clip covers its own subtopic mini-outline (separate from Blind Judge cold-viewer check)."""
+    outline = [str(x).strip() for x in ((cand.standalone_packaging or {}).get("video_outline") or []) if str(x).strip()]
+    if len(outline) < 2:
+        return {"covered": True, "missing_beats": [], "repair_instruction": ""}
+
+    script_txt, _ = _format_candidate_script(cand, sentences, id_to_idx, show_speakers=show_speakers, for_blind_audit=True)
+    if not script_txt:
+        return {"covered": True, "missing_beats": [], "repair_instruction": ""}
+
+    outline_str = "\n".join(f"{i + 1}. {b}" for i, b in enumerate(outline))
+    sys_prompt = (
+        "Eres Editor Jefe de Contenido. Verificas si el guion seleccionado de un vídeo cubre los puntos clave "
+        "de SU PROPIO mini-índice temático (sin exigir temas de otras partes del podcast). "
+        "Si un vídeo promete contar un subtema/biografía/hito y se salta justo el hecho central o la solución de ese subtema, "
+        "marca covered=false indicando exactamente qué punto falta. Responde solo en JSON válido."
+    )
+    usr_prompt = (
+        f"Subtema del vídeo: {cand.angle_theme or cand.summary}\n"
+        f"MINI-ÍNDICE PROPIO DE ESTE VÍDEO:\n{outline_str}\n\n"
+        f"GUION ACTUAL DEL CORTE:\n{script_txt}\n\n"
+        'Devuelve JSON exacto: {"covered": true/false, "missing_beats": ["punto del mini-índice que falta en el guion"], '
+        '"repair_instruction": "qué tramo o hecho concreto falta añadir y qué relleno podría podarse para encajar en duración"}'
+    )
+    try:
+        resp = llm.chat_json("fast", sys_prompt, usr_prompt, temperature=0.1, max_tokens=700, stage="outline_check")
+        covered = bool(resp.get("covered", True))
+        missing = [str(x).strip() for x in (resp.get("missing_beats") or []) if str(x).strip()]
+        if not missing:
+            covered = True
+        return {
+            "covered": covered,
+            "missing_beats": missing,
+            "repair_instruction": str(resp.get("repair_instruction") or "").strip(),
+        }
+    except Exception:
+        return {"covered": True, "missing_beats": [], "repair_instruction": ""}
 
 
 def _audit_and_refine_candidate(
@@ -2181,12 +2442,17 @@ def _audit_and_refine_candidate(
     already_used_intros: Optional[list[str]] = None,
     log_cb: Optional[Callable[[str], None]] = None,
     telemetry_cb: Optional[Callable[[dict[str, Any]], None]] = None,
+    rejected_records: Optional[list[dict[str, Any]]] = None,
 ) -> Optional[ClipCandidate]:
     """Blind Director / Cold-Viewer audit prioritizing real podcast voice first, then validated AI intro if needed."""
     blocked = blacklisted_indices or set()
     assembled_script, _ = _format_candidate_script(cand, sentences, id_to_idx, show_speakers=show_speakers)
     if not assembled_script:
         return None
+    if not cand.candidate_id:
+        cand.candidate_id = f"cand_{uuid.uuid4().hex[:8]}"
+    if not cand.original_title:
+        cand.original_title = (cand.metadata.titles[0] if cand.metadata.titles else cand.slug) or cand.id
 
     def _emit(msg: str) -> None:
         if log_cb is not None:
@@ -2198,9 +2464,32 @@ def _audit_and_refine_candidate(
     def _emit_tel(ev: dict[str, Any]) -> None:
         if telemetry_cb is not None:
             try:
-                telemetry_cb({"ts": time.time(), **ev})
+                telemetry_cb({"ts": time.time(), "candidate_id": cand.candidate_id, **ev})
             except Exception:
                 pass
+
+    def _record_rejection(reason_txt: str, eval_snap: Optional[dict[str, Any]] = None) -> None:
+        if rejected_records is None:
+            return
+        snap = eval_snap or {}
+        rejected_records.append(
+            {
+                "candidate_id": cand.candidate_id,
+                "title": clip_label,
+                "clip_type": cand.clip_type,
+                "score": cand.score,
+                "orig_start": cand.orig_start,
+                "orig_end": cand.orig_end,
+                "reason": reason_txt,
+                "comprehension_score": snap.get("comprehension_score"),
+                "context_clarity": snap.get("context_clarity"),
+                "clean_boundaries": snap.get("clean_boundaries"),
+                "resolution_score": snap.get("resolution_score"),
+                "story_interest_score": snap.get("story_interest_score"),
+                "who": snap.get("who"),
+                "candidate": cand.model_dump(mode="json"),
+            }
+        )
 
     def _build_pkg(
         ev: dict[str, Any],
@@ -2229,6 +2518,7 @@ def _audit_and_refine_candidate(
             "orphan_or_meta_refs": ev.get("orphan_or_meta_refs", []),
             "has_spoiler": bool(ev.get("has_spoiler", False)),
             "model_tier_used": tier_used,
+            "video_outline": list((cand.standalone_packaging or {}).get("video_outline") or []),
         }
 
     clip_label = cand.metadata.titles[0] if cand.metadata.titles else cand.slug
@@ -2244,6 +2534,18 @@ def _audit_and_refine_candidate(
         model_role="editorial",
         visual_bible=visual_bible,
     )
+    outline_chk = _check_outline_coverage(cand, sentences, id_to_idx, llm, show_speakers=show_speakers)
+    missing_outline = (not outline_chk["covered"]) and bool(outline_chk["missing_beats"])
+    if missing_outline:
+        eval_a["missing_context_items"] = [
+            *(eval_a.get("missing_context_items") or []),
+            *[f"Falta punto clave del mini-índice: {b}" for b in outline_chk["missing_beats"]],
+        ]
+        prev_dir = str(eval_a.get("director_instructions") or "").strip()
+        eval_a["director_instructions"] = (
+            (outline_chk.get("repair_instruction") or "Incluir los puntos clave faltantes del mini-índice sin pasarse de duración.")
+            + (f" | {prev_dir}" if prev_dir else "")
+        )
     _emit_tel(
         {
             "type": "judge_audit",
@@ -2268,9 +2570,10 @@ def _audit_and_refine_candidate(
             "opening_issue": eval_a.get("opening_issue", ""),
             "passed_full": eval_a["passed_full"],
             "passed_with_intro_only": eval_a["passed_with_intro_only"],
+            "outline_covered": outline_chk["covered"],
         }
     )
-    if eval_a["passed_full"] and not eval_a["needs_ai_intro_curtain"]:
+    if (not missing_outline) and eval_a["passed_full"] and not eval_a["needs_ai_intro_curtain"]:
         cand.standalone_packaging = _build_pkg(eval_a, "approve", "editorial", force_intro=False)
         cand.intro_curtain_enabled = False
         cand.summary = eval_a["standalone_summary"] or cand.summary
@@ -2293,7 +2596,7 @@ def _audit_and_refine_candidate(
 
     best_intro_cand: Optional[ClipCandidate] = None
     best_intro_score = -1
-    if eval_a["passed_full"] or eval_a["passed_with_intro_only"]:
+    if (not missing_outline) and (eval_a["passed_full"] or eval_a["passed_with_intro_only"]):
         act = "approve_needs_intro"
         cand.standalone_packaging = _build_pkg(
             eval_a,
@@ -2402,6 +2705,7 @@ def _audit_and_refine_candidate(
                 "narrative_archetype": cand.narrative_archetype,
                 "angle_id": cand.angle_id,
                 "angle_theme": cand.angle_theme,
+                "video_outline": list((cand.standalone_packaging or {}).get("video_outline") or []),
                 "chapters": [ch.model_dump() for ch in cand.metadata.chapters],
             },
             spans_idx=new_spans_idx,
@@ -2464,19 +2768,46 @@ def _audit_and_refine_candidate(
         return rebuilt, ver_eval, rep_issue, rep_intro_hint
 
     def _is_splice_safe_for_intro(ev_cand: dict[str, Any]) -> bool:
-        """True when clip body has clean structure/resolution and can be packaged with AI intro context."""
+        """True when clip body has clean structure/resolution and can be framed with an AI intro curtain."""
+        raw_res_val = int(ev_cand.get("raw_resolution_score", ev_cand.get("resolution_score", 0)))
+        res_ok = bool(ev_cand.get("resolution_answered", False)) or (
+            raw_res_val >= 65 and not ev_cand.get("has_spoiler", False)
+        )
         return bool(
             ev_cand.get("splices_coherent", True)
             and not ev_cand.get("broken_splices")
             and not ev_cand.get("has_spoiler", False)
             and ev_cand.get("clean_end", True)
-            and ev_cand.get("resolution_answered", False)
+            and int(ev_cand.get("comprehension_score", 0)) >= 45
+            and res_ok
         )
 
     achieved_passed_full = bool(eval_a["passed_full"])
     best_salvage_cand: Optional[ClipCandidate] = None
     best_salvage_score = -1
+    best_repaired_cand: Optional[ClipCandidate] = None
+    best_repaired_score = -1
     best_intro_hint = ""
+
+    def _track_repaired(
+        rebuilt_obj: ClipCandidate,
+        ver_obj: dict[str, Any],
+        tier_name: Literal["editorial", "editorial_strong"],
+        issue_txt: str,
+        hint_txt: str,
+    ) -> None:
+        nonlocal best_repaired_cand, best_repaired_score, best_intro_hint
+        if not ver_obj.get("has_spoiler", False) and (
+            best_repaired_cand is None or ver_obj["composite_score"] >= best_repaired_score
+        ):
+            rebuilt_obj.standalone_packaging = _build_pkg(
+                ver_obj, f"{tier_name}_refine->needs_intro", tier_name, issue_fixed=issue_txt, force_intro=True
+            )
+            rebuilt_obj.summary = ver_obj["standalone_summary"] or rebuilt_obj.summary
+            best_repaired_cand = rebuilt_obj
+            best_repaired_score = ver_obj["composite_score"]
+            if hint_txt:
+                best_intro_hint = hint_txt
 
     if best_intro_cand is None and _is_splice_safe_for_intro(eval_a):
         cand.standalone_packaging = _build_pkg(
@@ -2489,16 +2820,60 @@ def _audit_and_refine_candidate(
         best_salvage_cand = cand
         best_salvage_score = eval_a["composite_score"]
 
-    # Step B1: Try cheap repair first to fix with real podcast voice
-    if not is_severe:
+    # Step B1: Fast-Track keeps healthy body safe from expensive strong-tier escalation while still
+    # allowing 1 cheap boundary-repair attempt for 100% real podcast voice (guarded by Do-No-Harm).
+    intro_allowed = bool(profile is not None and profile.intro_curtain.enabled)
+    fast_track_healthy = bool(
+        intro_allowed
+        and (not missing_outline)
+        and (not eval_a.get("has_spoiler", False))
+        and eval_a.get("splices_coherent", True)
+        and (not eval_a.get("broken_splices"))
+        and eval_a.get("clean_end", True)
+        and (eval_a.get("resolution_answered", False) or int(eval_a.get("raw_resolution_score", 0)) >= 65)
+        and eval_a.get("comprehension_score", 0) >= 55
+        and (best_intro_cand is not None or best_salvage_cand is not None)
+    )
+    if fast_track_healthy:
+        _emit(
+            f"Fast-Track editorial para '{clip_label}': cuerpo sólido (comp={eval_a['comprehension_score']}, "
+            f"res={eval_a['resolution_score']}), protegiendo cuerpo original y omitiendo escalado fuerte."
+        )
+
+    def _repair_preserves_or_improves(ver_obj: dict[str, Any]) -> bool:
+        """Do-No-Harm guard: reject repairs that break splice coherence or degrade the original body."""
+        if not ver_obj.get("splices_coherent", True) or ver_obj.get("broken_splices"):
+            return False
+        if ver_obj.get("has_spoiler", False):
+            return False
+        orig_res = int(eval_a.get("raw_resolution_score", eval_a.get("resolution_score", 0)))
+        new_res = int(ver_obj.get("raw_resolution_score", ver_obj.get("resolution_score", 0)))
+        if orig_res >= 70 and new_res < orig_res - 15 and ver_obj["composite_score"] <= eval_a["composite_score"]:
+            return False
+        return ver_obj["composite_score"] >= (eval_a["composite_score"] - 5)
+
+    if fast_track_healthy or (not is_severe) or (not allow_strong_escalation):
         rebuilt_ed, ver_ed, issue_ed, hint_ed = _run_repair_and_verify("editorial")
         if rebuilt_ed is not None and ver_ed is not None:
+            rebuilt_ed.candidate_id = cand.candidate_id
+            rebuilt_ed.original_title = cand.original_title
             if ver_ed["passed_full"] and not ver_ed["needs_ai_intro_curtain"]:
                 rebuilt_ed.standalone_packaging = _build_pkg(
                     ver_ed, "refine->approve", "editorial", issue_fixed=issue_ed, force_intro=False
                 )
                 rebuilt_ed.intro_curtain_enabled = False
                 rebuilt_ed.summary = ver_ed["standalone_summary"] or rebuilt_ed.summary
+                _emit_tel(
+                    {
+                        "type": "candidate_outcome",
+                        "clip_title": clip_label,
+                        "clip_type": rebuilt_ed.clip_type,
+                        "accepted": True,
+                        "audit_action": "refine->approve",
+                        "reason": issue_ed or "Aprobado tras reparación con voz del podcast",
+                        "intro_curtain_text": "",
+                    }
+                )
                 _emit(f"Juez Ciego APRUEBA '{clip_label}' tras reparación con voz del podcast: {issue_ed}")
                 return rebuilt_ed
             if ver_ed["passed_full"]:
@@ -2516,7 +2891,7 @@ def _audit_and_refine_candidate(
                     best_intro_score = ver_ed["composite_score"]
                     if hint_ed:
                         best_intro_hint = hint_ed
-            elif ver_ed["passed_with_intro_only"] and ver_ed["composite_score"] >= best_intro_score:
+            elif ver_ed["passed_with_intro_only"] and _repair_preserves_or_improves(ver_ed) and ver_ed["composite_score"] >= best_intro_score:
                 rebuilt_ed.standalone_packaging = _build_pkg(
                     ver_ed, "refine->approve_needs_intro", "editorial", issue_fixed=issue_ed, force_intro=True
                 )
@@ -2525,7 +2900,7 @@ def _audit_and_refine_candidate(
                 best_intro_score = ver_ed["composite_score"]
                 if hint_ed:
                     best_intro_hint = hint_ed
-            elif _is_splice_safe_for_intro(ver_ed) and ver_ed["composite_score"] >= best_salvage_score:
+            elif _is_splice_safe_for_intro(ver_ed) and _repair_preserves_or_improves(ver_ed) and ver_ed["composite_score"] >= best_salvage_score:
                 rebuilt_ed.standalone_packaging = _build_pkg(
                     ver_ed, "refine->salvage_needs_intro", "editorial", issue_fixed=issue_ed, force_intro=True
                 )
@@ -2534,14 +2909,18 @@ def _audit_and_refine_candidate(
                 best_salvage_score = ver_ed["composite_score"]
                 if hint_ed:
                     best_intro_hint = hint_ed
+            elif _repair_preserves_or_improves(ver_ed):
+                _track_repaired(rebuilt_ed, ver_ed, "editorial", issue_ed, hint_ed)
 
     # Step B2: Escalate to editorial_strong ONLY when severe or cheap repair failed without a valid intro candidate
-    if allow_strong_escalation and (is_severe or (not achieved_passed_full and best_intro_cand is None)):
+    if (not fast_track_healthy) and allow_strong_escalation and (is_severe or (not achieved_passed_full and best_intro_cand is None)):
         if used_strong_ref is not None:
             used_strong_ref[0] += 1
         _emit(f"Escalando reparación quirúrgica de '{clip_label}' a modelo experto...")
         rebuilt_st, ver_st, issue_st, hint_st = _run_repair_and_verify("editorial_strong")
         if rebuilt_st is not None and ver_st is not None:
+            rebuilt_st.candidate_id = cand.candidate_id
+            rebuilt_st.original_title = cand.original_title
             if ver_st["passed_full"] and not ver_st["needs_ai_intro_curtain"]:
                 rebuilt_st.standalone_packaging = _build_pkg(
                     ver_st,
@@ -2552,6 +2931,17 @@ def _audit_and_refine_candidate(
                 )
                 rebuilt_st.intro_curtain_enabled = False
                 rebuilt_st.summary = ver_st["standalone_summary"] or rebuilt_st.summary
+                _emit_tel(
+                    {
+                        "type": "candidate_outcome",
+                        "clip_title": clip_label,
+                        "clip_type": rebuilt_st.clip_type,
+                        "accepted": True,
+                        "audit_action": "strong_refine->approve",
+                        "reason": issue_st or "Aprobado por experto con voz real",
+                        "intro_curtain_text": "",
+                    }
+                )
                 _emit(f"Juez Ciego APRUEBA '{clip_label}' (experto, voz real): {issue_st}")
                 return rebuilt_st
             if ver_st["passed_full"]:
@@ -2568,7 +2958,7 @@ def _audit_and_refine_candidate(
                 achieved_passed_full = True
                 if hint_st:
                     best_intro_hint = hint_st
-            elif ver_st["passed_with_intro_only"] and ver_st["composite_score"] >= best_intro_score:
+            elif ver_st["passed_with_intro_only"] and _repair_preserves_or_improves(ver_st) and ver_st["composite_score"] >= best_intro_score:
                 rebuilt_st.standalone_packaging = _build_pkg(
                     ver_st,
                     "strong_refine->approve_needs_intro",
@@ -2581,7 +2971,7 @@ def _audit_and_refine_candidate(
                 best_intro_score = ver_st["composite_score"]
                 if hint_st:
                     best_intro_hint = hint_st
-            elif _is_splice_safe_for_intro(ver_st) and ver_st["composite_score"] >= best_salvage_score:
+            elif _is_splice_safe_for_intro(ver_st) and _repair_preserves_or_improves(ver_st) and ver_st["composite_score"] >= best_salvage_score:
                 rebuilt_st.standalone_packaging = _build_pkg(
                     ver_st,
                     "strong_refine->salvage_needs_intro",
@@ -2594,11 +2984,32 @@ def _audit_and_refine_candidate(
                 best_salvage_score = ver_st["composite_score"]
                 if hint_st:
                     best_intro_hint = hint_st
+            elif _repair_preserves_or_improves(ver_st):
+                _track_repaired(rebuilt_st, ver_st, "editorial_strong", issue_st, hint_st)
 
     # Step C: Package body with AI intro curtain (pre-validated by Blind Judge!) so standalone context is crystal clear
-    intro_allowed = bool(profile is not None and profile.intro_curtain.enabled)
-    target_cand = best_intro_cand or (best_salvage_cand if intro_allowed else None)
+    target_cand = best_intro_cand or ((best_salvage_cand or best_repaired_cand) if intro_allowed else None)
+    if (
+        target_cand is None
+        and intro_allowed
+        and (not missing_outline)
+        and eval_a.get("splices_coherent", True)
+        and (not eval_a.get("broken_splices"))
+        and (not eval_a.get("has_spoiler", False))
+        and int(eval_a.get("comprehension_score", 0)) >= 45
+    ):
+        # Last-resort Step C check on the unbroken original body when NLE repairs degraded coherence
+        cand.standalone_packaging = _build_pkg(
+            eval_a,
+            "orig_needs_intro",
+            "editorial",
+            issue_fixed=eval_a.get("opening_issue", ""),
+            force_intro=True,
+        )
+        target_cand = cand
     if target_cand is not None:
+        target_cand.candidate_id = cand.candidate_id
+        target_cand.original_title = cand.original_title
         target_cand.standalone_packaging["needs_ai_intro_curtain"] = True
         if intro_allowed and profile is not None:
             ic_script = generate_intro_curtain_script(
@@ -2616,16 +3027,68 @@ def _audit_and_refine_candidate(
             target_cand.intro_curtain_phrases = ic_script["phrases"]
             target_cand.intro_curtain_badge = ic_script["badge"]
 
+            last_ei = id_to_idx.get(
+                target_cand.narrative_spans[-1].end_sentence_id
+                if target_cand.narrative_spans
+                else target_cand.end_sentence_id
+            )
+            dangling_last = (
+                last_ei is not None
+                and _norm_last_word(sentences[last_ei].text) in DANGLING_END_WORDS
+            )
+            pre_splices_ok = bool((target_cand.standalone_packaging or {}).get("splices_coherent", True))
+            pre_res_score = int((target_cand.standalone_packaging or {}).get("resolution_score", 0) or 0)
+            pre_res_ok = bool(eval_a.get("resolution_answered", False)) or pre_res_score >= 70
+
             def _eval_intro_ok(ev_ic: dict[str, Any]) -> bool:
+                splices_native = bool(ev_ic.get("splices_coherent", True)) and not bool(ev_ic.get("broken_splices"))
+                splices_pass = splices_native or pre_splices_ok
+                min_comp = 60 if splices_native else 50
+                raw_ic_res = int(ev_ic.get("raw_resolution_score", ev_ic.get("resolution_score", 0)))
+                res_pass = (
+                    bool(ev_ic.get("resolution_answered", False))
+                    or (
+                        target_cand.clip_type == "short_cliffhanger"
+                        and (
+                            raw_ic_res >= 55
+                            or (
+                                ev_ic["comprehension_score"] >= 65
+                                and ev_ic["context_clarity"] >= 75
+                                and not bool(ev_ic.get("has_spoiler", False))
+                                and bool(
+                                    str(ev_ic.get("central_question_or_conflict") or "").strip()
+                                    or str(ev_ic.get("answer_or_mystery_stated") or "").strip()
+                                )
+                            )
+                        )
+                    )
+                    or (
+                        target_cand.clip_type == "short_conclusive"
+                        and not bool(ev_ic.get("has_spoiler", False))
+                        and (
+                            raw_ic_res >= 65
+                            or (
+                                pre_res_ok
+                                and ev_ic["comprehension_score"] >= 65
+                                and ev_ic["context_clarity"] >= 80
+                                and splices_pass
+                            )
+                        )
+                    )
+                    or (
+                        target_cand.clip_type in ("medium", "long")
+                        and ev_ic["comprehension_score"] >= 65
+                        and ev_ic["context_clarity"] >= 70
+                    )
+                )
                 return bool(
                     (not ev_ic["who_unknown"])
                     and (not ev_ic["what_unknown"])
-                    and ev_ic.get("clean_end", True)
-                    and ev_ic.get("splices_coherent", True)
-                    and not ev_ic.get("broken_splices")
-                    and ev_ic.get("resolution_answered", False)
+                    and (not dangling_last)
+                    and splices_pass
+                    and res_pass
                     and (not ev_ic.get("has_spoiler", False))
-                    and ev_ic["comprehension_score"] >= 65
+                    and ev_ic["comprehension_score"] >= min_comp
                     and ev_ic["context_clarity"] >= 65
                 )
 
@@ -2686,6 +3149,11 @@ def _audit_and_refine_candidate(
                 intro_ok = _eval_intro_ok(intro_eval)
 
             if not intro_ok:
+                rej_reason = (
+                    f"who={intro_eval.get('who')}, comp={intro_eval['comprehension_score']}, "
+                    f"ctx={intro_eval['context_clarity']}, splices_ok={intro_eval.get('splices_coherent', True)}, "
+                    f"res_ok={intro_eval.get('resolution_answered')}"
+                )
                 _emit_tel(
                     {
                         "type": "candidate_outcome",
@@ -2693,10 +3161,11 @@ def _audit_and_refine_candidate(
                         "clip_type": target_cand.clip_type,
                         "accepted": False,
                         "audit_action": "reject_with_intro",
-                        "reason": f"who={intro_eval.get('who')}, comp={intro_eval['comprehension_score']}, ctx={intro_eval['context_clarity']}, splices_ok={intro_eval.get('splices_coherent', True)}",
+                        "reason": rej_reason,
                         "intro_curtain_text": target_cand.intro_curtain_text,
                     }
                 )
+                _record_rejection(f"Rechazado incluso con cortinilla IA ({rej_reason})", intro_eval)
                 _emit(
                     f"Juez Ciego RECHAZA '{clip_label}' incluso con cortinilla IA "
                     f"(who={intro_eval.get('who')}, what={intro_eval.get('what_and_context')}, "
@@ -2744,6 +3213,7 @@ def _audit_and_refine_candidate(
             )
         return target_cand
 
+    dis_reason = eval_a.get("opening_issue") or "Sin contexto autónomo válido"
     _emit_tel(
         {
             "type": "candidate_outcome",
@@ -2751,10 +3221,11 @@ def _audit_and_refine_candidate(
             "clip_type": cand.clip_type,
             "accepted": False,
             "audit_action": "discard",
-            "reason": eval_a.get("opening_issue") or "Sin contexto autónomo válido",
+            "reason": dis_reason,
             "intro_curtain_text": "",
         }
     )
+    _record_rejection(f"Descartado por Juez Ciego: {dis_reason}", eval_a)
     _emit(f"Juez Ciego DESCARTA '{clip_label}': no pudo garantizar contexto autónomo válido; se buscará otro ángulo.")
     return None
 
@@ -2772,11 +3243,11 @@ def _plan_distinct_episode_angles(
     log_cb: Optional[Callable[[str], None]] = None,
 ) -> list[dict[str, Any]]:
     """Plan mutually exclusive thematic sub-angles/chapters before Short selection."""
-    if total_shorts <= 1 or not sentences:
+    if total_shorts <= 0 or not sentences:
         return []
 
     blocked = blacklisted_indices or set()
-    ask_angles = max(total_shorts + 2, 4)
+    ask_angles = min(12, max(total_shorts * 3, 6))
 
     overview_lines: list[str] = []
     if block_map:
@@ -2789,16 +3260,17 @@ def _plan_distinct_episode_angles(
             if b_ref and b_ref.get("sentences"):
                 clean_b = [s for s in b_ref["sentences"][:3]]
                 sample = " ".join(s.text for s in clean_b)[:140]
+            resumen = " ".join(str(m.get("resumen_breve") or "").split())[:220]
             overview_lines.append(
-                f"- BLOQUE B{bi} ({m.get('tema', '')}) | hook={m.get('potencial_cliffhanger', 5)}/10 "
-                f"concl={m.get('potencial_conclusivo', 5)}/10 | Muestra: {sample}"
+                f"- BLOQUE B{bi} ({m.get('tema', '')}) | interés={m.get('interes_general', 5)}/10 "
+                f"hook={m.get('potencial_cliffhanger', 5)}/10 concl={m.get('potencial_conclusivo', 5)}/10 "
+                f"| Resumen: {resumen} | Muestra: {sample}"
             )
     else:
         for bi, b in enumerate(blocks):
             clean_b = [s for s in b.get("sentences", [])]
             if not clean_b:
                 continue
-            # Skip mostly-blacklisted blocks
             sample_txt = " ".join(s.text for s in clean_b[:5])[:220]
             overview_lines.append(
                 f"- BLOQUE B{bi} ({clean_b[0].start:.0f}s..{clean_b[-1].end:.0f}s, energía={b.get('energy', 'media')}): {sample_txt}"
@@ -2815,9 +3287,10 @@ def _plan_distinct_episode_angles(
     sys_prompt = (
         "Eres Showrunner Editorial y Estratega de Contenido Vertical experto en planificación temática de podcasts. "
         "Incluso cuando un episodio trata sobre un único protagonista o gran tema, SIEMPRE contiene sub-ángulos, "
-        "capítulos, problemas técnicos, anécdotas, dilemas o curiosidades COMPLETAMENTE DISTINTOS entre sí.\n"
-        "Tu misión es dividir el episodio en sub-ángulos independientes que NO se repitan ni compartan la misma idea central, "
-        "identificando qué bloques aportan el contexto inicial y cuáles contienen el clímax o remate.\n"
+        "capítulos, anécdotas humanas/épicas, giros de inteligencia o espionaje, dilemas y clímax COMPLETAMENTE DISTINTOS entre sí.\n"
+        "Tu misión es detectar las historias MÁS MAGNÉTICAS, DRAMÁTICAS Y MEMORABLES del episodio completo "
+        "(priorizando anécdotas de acción, giros inesperados, espionaje, errores fatales o datos sorprendentes por encima de descripciones geográficas o listas técnicas), "
+        "identificando qué bloques contienen cada historia.\n"
         "Responde SOLO JSON válido con clave 'angles'."
     )
     usr_prompt = (
@@ -2825,13 +3298,14 @@ def _plan_distinct_episode_angles(
         f"Tema global del episodio: {vb.get('episode_topic', '')}\n"
         f"Época/Escenario: {vb.get('era_or_setting', '')}\n"
         f"Hilo narrativo: {vb.get('narrative_spine', '')}\n"
-        f"Necesitamos al menos {ask_angles} sub-ángulos TOTALMENTE INDEPENDIENTES para cubrir cuotas ({mod_desc or f'shorts={total_shorts}'}).\n\n"
-        "REGLAS ESTRICTAS DE DIVERSIFICACIÓN:\n"
-        "1. CADA sub-ángulo debe responder a una pregunta, conflicto o anécdota DISTINTA (ej. fallo de combate vs. orígenes/motivación vs. barreras de género vs. solución técnica concreta vs. legado).\n"
-        "2. PROHIBIDO proponer dos ángulos sobre el mismo invento/evento si solo cambia el título.\n"
-        "3. Indica qué bloques `B#` contienen la historia (`target_blocks`) y qué contexto necesita un espectador nuevo que no ha visto el podcast (`cold_viewer_context`).\n\n"
+        f"Planifica {ask_angles} sub-ángulos TOTALMENTE INDEPENDIENTES ordenados de mayor a menor gancho narrativo para cubrir cuotas ({mod_desc or f'shorts={total_shorts}'}) y tener alternativas sólidas.\n\n"
+        "REGLAS ESTRICTAS DE DIVERSIFICACIÓN Y SELECCIÓN:\n"
+        "1. PRIORIZA LAS GRANDES HISTORIAS DEL EPISODIO: Busca episodios memorables, hazañas, choques inesperados, espías/engaños o dilemas humanos a lo largo de TODO el mapa (principio, nudo y clímax), NO te quedes solo con la introducción logística.\n"
+        "2. CADA sub-ángulo debe responder a una pregunta, conflicto o anécdota DISTINTA.\n"
+        "3. PROHIBIDO proponer dos ángulos sobre el mismo evento si solo cambia el título.\n"
+        "4. Indica qué bloques `B#` contienen la historia (`target_blocks`) y qué contexto necesita un espectador nuevo que no ha visto el podcast (`cold_viewer_context`).\n\n"
         "MAPA DEL EPISODIO:\n"
-        + "\n".join(overview_lines[:28])
+        + "\n".join(overview_lines[:48])
         + "\n\nDevuelve JSON exacto:\n"
         '{"angles": [{"angle_id": "A1", "angle_theme": "título concreto del sub-ángulo (3-8 palabras)", '
         '"central_question": "pregunta específica que responde o plantea este ángulo", '
@@ -2841,7 +3315,7 @@ def _plan_distinct_episode_angles(
     )
 
     try:
-        resp = llm.chat_json("editorial", sys_prompt, usr_prompt, temperature=0.25, max_tokens=2000)
+        resp = llm.chat_json("editorial", sys_prompt, usr_prompt, temperature=0.25, max_tokens=2600, stage="plan_angles")
     except Exception:
         return []
 
@@ -3006,18 +3480,20 @@ def _select_shorts_by_modality(
         "1. DIVERSIDAD TEMÁTICA ESTRICTA: Cada candidato en 'clips' DEBE tratar un capítulo/sub-tema/anécdota COMPLETAMENTE DISTINTO y no solaparse temporalmente con los demás.\n"
         "2. MONTAJE ORGÁNICO (RECORTAR, PODAR Y UNIR): Usa preferentemente 1 tramo continuo completo o máximo 2-3 tramos bien hilados en ORDEN CRONOLÓGICO. "
         "Poda cualquier inciso molesto con `drop_sentence_ids`. Respeta las marcas `--- [PAUSA MUSICAL / CAMBIO DE BLOQUE] ---` (no pegues dos frases desconectadas de bloques musicales distintos sin puente).\n"
-        "3. ARRANQUE FUERTE Y CONTEXTO (PRIMEROS 4-6s): El primer tramo debe empezar con fuerza (SIN 'Bueno, pues...', 'A ver...', 'Mientras tanto...'). "
+        "3. ARRANQUE FUERTE Y CONTEXTO (PRIMEROS 4-6s): El primer tramo debe empezar con fuerza (PROHIBIDO abrir con muletillas como 'Como la cosa estaba...', 'Bueno, pues...', 'A ver...' ni con verbos en infinitivo dependientes como 'revelar...'). "
         "Si la historia viene de mitad del episodio y empieza con 'ella' o 'esta mujer', antepón `context_intro` de 1-2 frases limpias o asume que irá con cortinilla IA de contexto.\n"
-        "4. PRESUPUESTO EXACTO DE TIEMPO: Cada línea tiene su duración `[S#### | X.Xs]`. Suma los segundos para que el total bruto quede entre "
+        "4. MINI-ÍNDICE DEL SUBTEMA (`video_outline`): Antes de elegir los IDs, redacta un `video_outline` de 3–4 puntos concretos PARA ESTE VÍDEO (en contexto al subtema elegido, NO temas de otras partes del podcast). Cada tramo elegido debe cubrir ese mini-índice sin saltarse el hecho/nudo/solución central del subtema (usa `drop_sentence_ids` para podar relleno si hace falta espacio).\n"
+        "5. PRESUPUESTO EXACTO DE TIEMPO: Cada línea tiene su duración `[S#### | X.Xs]`. Suma los segundos para que el total bruto quede entre "
         f"~{buf_min:.0f}s y {buf_max:.0f}s (y post-corte en {window.min_sec:.0f}s–{window.max_sec:.0f}s) SIN quedarte corto ni pasarte y cortar el final.\n"
-        "5. CERO ANUNCIOS NI PROMOS: Nunca incluyas menciones a episodios de pago, Patreon, precios, suscripciones, capítulos anteriores ni despedidas.\n"
-        "6. CIERRE LIMPIO (HARD STOP): Termina exactamente en la oración completa que remata la idea/respuesta (en conclusivo) o fija la pregunta abierta (en cliffhanger)."
+        "6. CERO ANUNCIOS NI PROMOS: Nunca incluyas menciones a episodios de pago, Patreon, precios, suscripciones, capítulos anteriores ni despedidas.\n"
+        "7. CIERRE LIMPIO (HARD STOP): Termina exactamente en la oración completa que remata la idea/respuesta (en conclusivo) o fija la pregunta abierta (en cliffhanger)."
         f"{speaker_note}{exclude_note}\n"
         f"- Selecciona {ask_n} candidatos TEMÁTICAMENTE DISTINTOS.\n\n"
         "Formato JSON de cada objeto en 'clips':\n"
         "{\n"
         '  "angle_id": "A1",\n'
         '  "angle_theme": "sub-tema único distinto al resto de clips",\n'
+        '  "video_outline": ["1) Contexto o detonante del subtema", "2) Hecho/problema central del subtema", "3) Resolución o clímax exacto"],\n'
         '  "narrative_archetype": "mini_historia | pregunta_respuesta | dato_contraintuitivo | debate_contraste | cliffhanger_70_30",\n'
         '  "narrative_contract": {\n'
         '    "who": "Protagonista/entidad nombrada literalmente en el audio o en contexto",\n'
@@ -3039,7 +3515,7 @@ def _select_shorts_by_modality(
         f"TRANSCRIPCIÓN:\n{transcript_excerpt}"
     )
 
-    resp = llm.chat_json(model_role, sys_prompt, usr_prompt, temperature=0.22, max_tokens=5500)
+    resp = llm.chat_json(model_role, sys_prompt, usr_prompt, temperature=0.22, max_tokens=5500, stage=f"select_{modality}")
     raw_clips = resp.get("clips") or resp.get("items") or []
     return _parse_candidates_from_llm(
         raw_clips,
@@ -3069,6 +3545,7 @@ def _select_longform_arcs(
     energy_blocks: list[dict],
     show_speakers: bool = False,
     blacklisted_indices: Optional[set[int]] = None,
+    visual_bible: Optional[dict[str, Any]] = None,
 ) -> list[ClipCandidate]:
     if count <= 0 or not blocks:
         return []
@@ -3099,7 +3576,7 @@ def _select_longform_arcs(
             '{"start_block": 1, "end_block": 2, "theme": "Título del arco"}.\n\n'
             + "\n".join(compact_lines)
         )
-        arc_resp = llm.chat_json("editorial", arc_sys, arc_usr, temperature=0.2, max_tokens=1500)
+        arc_resp = llm.chat_json("editorial", arc_sys, arc_usr, temperature=0.2, max_tokens=1500, stage=f"select_arcs_{clip_type}")
         arcs = arc_resp.get("arcs") or []
     else:
         arcs = [{"start_block": 0, "end_block": len(blocks) - 1, "theme": "Arco principal"}]
@@ -3140,31 +3617,43 @@ def _select_longform_arcs(
                 + "\n\n"
             )
 
+        vb_arc = visual_bible or {}
+        vb_context = ""
+        if vb_arc.get("episode_topic") or vb_arc.get("narrative_spine"):
+            vb_context = (
+                f"Contexto del episodio: {vb_arc.get('episode_topic', '')}\n"
+                f"Hilo global del episodio (útil solo si encaja con este arco): {vb_arc.get('narrative_spine', '')}\n"
+            )
+
         sys_prompt = (
             "Eres Showrunner y Montador Jefe de YouTube (documentales y vídeo-podcasts de alta retención). "
-            "Seleccionas un arco AUTOCONCLUSIVO usando IDs `[S#### | X.Xs]` donde en los primeros 4-6 segundos quede claro quién/qué/cuándo, "
-            "podas cualquier cuña o digresión con `drop_sentence_ids`, y cierras con una resolución o conclusión real del propio podcast "
-            "(NUNCA cortado a mitad de biografía o explicación). Responde exclusivamente en JSON con clave 'clips'."
+            "Para este arco concreto defines primero su MINI-ÍNDICE (`video_outline`) con los 3–5 hitos esenciales "
+            "de ESE subtema específico y seleccionas tramos `[S#### | X.Xs]` que los cubran TODOS sin saltarse lo más importante "
+            "(NUNCA saltes del pasado/infancia directo al epílogo olvidando el logro, conflicto o solución principal). Responde exclusivamente en JSON con clave 'clips'."
         )
         usr_prompt = (
             f"{_profile_editorial_context(profile)}\n\n"
+            f"{vb_context}"
             f"Tema del arco: {arc.get('theme', 'Tema completo')}\n"
             f"Selecciona 1 pieza magistral ({label_dur}, bruto aprox. {buf_min:.0f}s–{buf_max:.0f}s, post-corte {window.min_sec:.0f}s–{window.max_sec:.0f}s).\n\n"
             "CONTRATO DE VÍDEO AUTOCONCLUSIVO Y MONTAJE NLE:\n"
-            "1. ESTRUCTURA CLARA DESDE EL INICIO: Usa hasta 4 tramos cronológicos (`context_intro`, `core`, `payoff`) + 1 `cold_open_hook` opcional y disjunto al principio (sin repetirlo después). "
-            "Los primeros 4-6 segundos deben situar sujeto, escenario y conflicto con oraciones completas (PROHIBIDO empezar con 'Mientras tanto...', 'Y bueno...' ni saludos).\n"
-            "2. CONTEXT INTRO SI FALTABA EL SUJETO: Si el arco viene de mitad del episodio y no presenta al protagonista/problema, antepón `role='context_intro'` tomado de la Presentación Inicial.\n"
-            "3. PODA DE ANUNCIOS Y DIGRESIONES: Si en medio hay muletillas meta-podcast ('en esta santa casa', 'si me sobra media hora'), añádelas a `drop_sentence_ids`.\n"
-            "4. CIERRE CONCLUSIVO REAL DEL PODCAST: Suma las duraciones `[X.Xs]` para llegar al clímax y abarca/empalma `payoff` con el remate completo; nunca cortes dejando la historia a medias.\n"
-            "5. Usa score entero entre 0 y 100. El hook_text debe tener máximo 7 palabras.\n\n"
-            "Devuelve JSON {'clips': [{'narrative_archetype': 'arco_documental', 'drop_sentence_ids': [], 'spans': ["
+            "1. MINI-ÍNDICE DEL VÍDEO (`video_outline`, 3–5 puntos): Define exactamente qué 3–5 hitos debe cubrir ESTE vídeo según su tema "
+            "(p. ej. si trata de un personaje/subtema, incluye origen -> hecho o conflicto central de ese subtema -> cómo lo resolvió -> desenlace/legado). "
+            "Selecciona los tramos para cumplir el 100% de ese mini-índice dentro del presupuesto de tiempo.\n"
+            "2. ESTRUCTURA CLARA DESDE EL INICIO: Usa hasta 4 tramos cronológicos (`context_intro`, `core`, `payoff`) + 1 `cold_open_hook` opcional y disjunto al principio (sin repetirlo después). "
+            "Los primeros 4-6 segundos deben situar sujeto, escenario y conflicto con oraciones completas (PROHIBIDO empezar con 'Mientras tanto...', 'Y bueno...', 'Como la cosa estaba...').\n"
+            "3. PODA INTELIGENTE CON `drop_sentence_ids`: Si incluir el hito central del mini-índice exige espacio, poda anécdotas secundarias o digresiones con `drop_sentence_ids` para que quepa todo sin cortar la parte más importante.\n"
+            "4. CIERRE CONCLUSIVO REAL DEL PODCAST: Suma las duraciones `[X.Xs]` para llegar al clímax y abarca/empalma `payoff` con el remate completo.\n"
+            "5. Usa score entero entre 0 y 100. El hook_text debe tener máximo 7 palabras y terminar en una frase completa.\n\n"
+            "Devuelve JSON {'clips': [{'narrative_archetype': 'arco_documental', "
+            "'video_outline': ['1) ...', '2) ...', '3) ...', '4) ...'], 'drop_sentence_ids': [], 'spans': ["
             "{'start_sentence_id': 'S...', 'end_sentence_id': 'S...', 'role': 'cold_open_hook|context_intro|core|payoff'}], "
             "score, summary, hook_reason, hook_text, titles (3), description, hashtags (5), thumbnail_text, "
             "chapters: [{title, sentence_id}]}]}.\n\n"
             f"{anchor_block}"
             f"TRANSCRIPCIÓN DEL TRAMO:\n{arc_text}"
         )
-        resp = llm.chat_json("editorial", sys_prompt, usr_prompt, temperature=0.2, max_tokens=3500)
+        resp = llm.chat_json("editorial", sys_prompt, usr_prompt, temperature=0.2, max_tokens=3500, stage=f"select_longform_{clip_type}")
         raw_clips = (
             resp.get("clips")
             or resp.get("items")
@@ -3217,6 +3706,8 @@ def _deduplicate_and_audit(
     global_topic_stopwords: Optional[set[str]] = None,
     log_cb: Optional[Callable[[str], None]] = None,
     telemetry_cb: Optional[Callable[[dict[str, Any]], None]] = None,
+    audited_signatures: Optional[set[str]] = None,
+    rejected_records: Optional[list[dict[str, Any]]] = None,
 ) -> list[ClipCandidate]:
     """Select Top N non-overlapping, thematically distinct clips with Blind Director audit before rendering."""
     if requested <= 0 or not sentences:
@@ -3226,6 +3717,14 @@ def _deduplicate_and_audit(
     ordered = sorted(candidates, key=lambda c: c.score, reverse=True)
     chosen: list[ClipCandidate] = []
     chosen_topic_clips: list[ClipCandidate] = list(existing_clips or [])
+    seen_sigs = audited_signatures if audited_signatures is not None else set()
+
+    def _cand_sig(c: ClipCandidate) -> str:
+        if c.narrative_spans:
+            sp_key = ",".join(f"{sp.start_sentence_id}-{sp.end_sentence_id}" for sp in c.narrative_spans)
+        else:
+            sp_key = f"{c.start_sentence_id}-{c.end_sentence_id}"
+        return f"{c.clip_type}:{sp_key}"
 
     def _emit(msg: str) -> None:
         if log_cb is not None:
@@ -3263,15 +3762,31 @@ def _deduplicate_and_audit(
                         f"Filtro temático descarta '{cand_obj.angle_theme or cand_obj.slug}' "
                         f"(similitud={sim:.2f} con '{prev.angle_theme or prev.slug}')."
                     )
+                    if rejected_records is not None:
+                        rejected_records.append(
+                            {
+                                "candidate_id": cand_obj.candidate_id or cand_obj.id,
+                                "title": (cand_obj.metadata.titles[0] if cand_obj.metadata.titles else cand_obj.slug),
+                                "clip_type": cand_obj.clip_type,
+                                "score": cand_obj.score,
+                                "orig_start": cand_obj.orig_start,
+                                "orig_end": cand_obj.orig_end,
+                                "reason": f"Filtro temático (similitud={sim:.2f} con '{prev.angle_theme or prev.slug}')",
+                                "candidate": cand_obj.model_dump(mode="json"),
+                            }
+                        )
                     return True
         return False
 
     non_conflicting: list[ClipCandidate] = []
     for c in ordered:
+        sig = _cand_sig(c)
+        if sig in seen_sigs:
+            continue
         if not conflicts(_cand_intervals(c), c):
             non_conflicting.append(c)
 
-    max_candidates = min(len(non_conflicting), max(requested + 3, 5))
+    max_candidates = min(len(non_conflicting), max(requested + 4, 6))
     to_audit = non_conflicting[:max_candidates]
     strong_budget = max_strong_repairs if max_strong_repairs is not None else max(2, requested + 1)
     strong_used = [0]
@@ -3280,6 +3795,10 @@ def _deduplicate_and_audit(
     for idx_c, cand in enumerate(to_audit):
         if len(chosen) >= requested:
             break
+        sig = _cand_sig(cand)
+        if sig in seen_sigs:
+            continue
+        seen_sigs.add(sig)
         if conflicts(_cand_intervals(cand), cand):
             continue
         if progress_cb is not None and progress_range is not None:
@@ -3308,6 +3827,7 @@ def _deduplicate_and_audit(
             already_used_intros=already_used_intros,
             log_cb=log_cb,
             telemetry_cb=telemetry_cb,
+            rejected_records=rejected_records,
         )
         if audited is not None:
             aud_ivs = _cand_intervals(audited)
@@ -3504,7 +4024,7 @@ def generate_final_clip_metadata(
     )
 
     try:
-        resp = llm.chat_json("fast", sys_prompt, usr_prompt, temperature=0.2, max_tokens=2048)
+        resp = llm.chat_json("fast", sys_prompt, usr_prompt, temperature=0.2, max_tokens=2048, stage="final_metadata")
     except Exception:
         return clip.metadata
 
@@ -3513,7 +4033,7 @@ def generate_final_clip_metadata(
 
     titles = [str(t).strip() for t in (resp.get("titles") or []) if str(t).strip()][:3] or clip.metadata.titles
     hook_words = str(resp.get("hook_text") or clip.metadata.hook_text or titles[0]).strip().split()
-    hook_text = " ".join(hook_words[:7])
+    hook_text = _clean_trailing_hook_words(" ".join(hook_words[:7]))
 
     chapters: list[ChapterMark] = []
     if is_longform:
@@ -3640,9 +4160,7 @@ def generate_intro_curtain_script(
             spoken = f"{era}: {ctx_core[0].lower() + ctx_core[1:] if len(ctx_core) > 1 else ctx_core}."
         else:
             spoken = f"{ctx_core}." if ctx_core else "Esta historia oculta cambió el rumbo del episodio."
-        words = spoken.split()
-        if len(words) > 22:
-            spoken = " ".join(words[:21]).rstrip(",;:") + "."
+        spoken = _trim_intro_cleanly(spoken, max_words=22)
         badge = (ic.badge_text or "").strip() or ("CONTEXTO CLAVE" if clip.clip_type.startswith("short") else "CLAVE DEL RELATO")
         return {
             "spoken_hook": spoken,
@@ -3673,13 +4191,14 @@ def generate_intro_curtain_script(
     system = (
         "Eres Guionista Experto en Retención Viral para YouTube Shorts, Reels y Podcasts.\n"
         "Debes escribir la CORTINILLA DE APERTURA (locución IA breve previa al audio del podcast) para que cualquier espectador que NO ha visto el podcast entienda el vídeo al 100% desde el segundo 0.\n"
-        "Tu objetivo es resolver en segundos QUIÉN es el protagonista/sujeto exacto, CUÁNDO/DÓNDE ocurre y CUÁL es el problema o enigma de ESTE sub-ángulo.\n"
+        "Tu objetivo es situar en una sola frase directa QUIÉN es el protagonista/sujeto exacto, CUÁNDO/DÓNDE ocurre y CUÁL es el problema o enigma de ESTE fragmento.\n"
         "REGLAS ESTRICTAS:\n"
-        "1. LONGITUD Y LOCUCIÓN NATURAL: 1 o 2 frases directas de 12 a 22 palabras (~3.5s a 5.8s), escritas en español fluido para voz en off (evita abreviaturas raras o paréntesis).\n"
-        "2. PROHIBIDO usar fórmulas vacías como '¿Sabías este dato sobre...?' o repetir/parafrasear las primeras palabras literales del podcast.\n"
-        "3. PROHIBIDO dejar pronombres sueltos ('ella', 'esta mujer', 'esto') sin nombrar antes al sujeto real y su contexto.\n"
-        "4. PUENTE NATURAL: La última palabra de la cortinilla debe conectar como un guante con la primera frase del podcast (como si el narrador diera paso al protagonista).\n"
-        "5. `phrases`: divide exactamente el texto de `spoken_hook` en 2 a 4 pantallas cortas de lectura rápida (3-6 palabras cada una)."
+        "1. LONGITUD Y LOCUCIÓN NATURAL: 1 sola frase incisiva de 10 a 15 palabras (~3.5s a 5.2s), en español fluido para voz en off (NUNCA más de 16 palabras ni paréntesis ni abreviaturas).\n"
+        "2. FIDELIDAD ABSOLUTA AL TRAMO REAL: Describe SOLO hechos que realmente ocurran o se escuchen en la TRANSCRIPCIÓN DEL TRAMO de abajo. PROHIBIDO inventar conclusiones o dramas que no pasan en el audio.\n"
+        "3. ANTI-REDUNDANCIA: PROHIBIDO usar fórmulas vacías ('¿Sabías este dato sobre...?') y PROHIBIDO repetir o parafrasear la primera frase literal del podcast.\n"
+        "4. PROHIBIDO dejar pronombres sueltos ('ella', 'esta mujer', 'esto') sin nombrar antes al sujeto real y su contexto.\n"
+        "5. PUENTE NATURAL: La última palabra de la cortinilla debe dar paso fluido a la primera frase del podcast.\n"
+        "6. `phrases`: divide EXACTAMENTE todas las palabras de `spoken_hook` (sin omitir ni resumir ninguna palabra) en 2 a 4 pantallas cortas de 3–5 palabras."
         f"{cliff_rule}\n"
         'Responde SOLO JSON válido: {"spoken_hook": "...", "phrases": ["...", "..."], "badge": "ETIQUETA 1-3 PALABRAS"}'
     )
@@ -3702,13 +4221,36 @@ def generate_intro_curtain_script(
         f"TRANSCRIPCIÓN COMPLETA DEL TRAMO:\n{body_excerpt}"
     )
 
+    def _opening_overlap_ratio(cand_text: str) -> float:
+        if not opening_quote:
+            return 0.0
+        stop = {"el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "en", "a", "al", "y", "o", "que", "con", "por", "para", "se", "su", "sus", "es", "fue", "eran", "bueno", "pues"}
+        a_toks = {t for t in _normalize_glossary_token(cand_text).split() if len(t) > 2 and t not in stop}
+        b_toks = {t for t in _normalize_glossary_token(opening_quote).split() if len(t) > 2 and t not in stop}
+        if not a_toks or not b_toks:
+            return 0.0
+        return len(a_toks & b_toks) / max(1, min(len(a_toks), len(b_toks)))
+
     resp: Any = None
     for role_tier in ("fast", "editorial"):
         try:
-            cand_resp = llm.chat_json(role_tier, system, user, temperature=0.35, max_tokens=800)
+            cand_resp = llm.chat_json(role_tier, system, user, temperature=0.35, max_tokens=800, stage="intro_curtain")
             if isinstance(cand_resp, dict):
                 cand_spoken = re.sub(r"\s+", " ", str(cand_resp.get("spoken_hook") or "").strip())
                 if len(cand_spoken.split()) >= 6 and "sabías este dato sobre" not in cand_spoken.lower():
+                    if _opening_overlap_ratio(cand_spoken) >= 0.55 and not anti_spoiler_note:
+                        # Retry once asking explicitly not to paraphrase the opening sentence
+                        retry_usr = (
+                            user
+                            + "\n\nATENCIÓN: Tu borrador anterior repetía casi las mismas palabras que el inicio del podcast. "
+                            "Aporta SOLO el contexto previo (año, escenario, quién es el protagonista y qué estaba en juego) SIN parafrasear la apertura."
+                        )
+                        try:
+                            cand_retry = llm.chat_json(role_tier, system, retry_usr, temperature=0.35, max_tokens=800, stage="intro_curtain_dedup")
+                            if isinstance(cand_retry, dict) and len(str(cand_retry.get("spoken_hook") or "").split()) >= 6:
+                                cand_resp = cand_retry
+                        except Exception:
+                            pass
                     resp = cand_resp
                     break
         except Exception:
@@ -3720,16 +4262,17 @@ def generate_intro_curtain_script(
     spoken = re.sub(r"\s+", " ", str(resp.get("spoken_hook") or "").strip())
     if not spoken or len(spoken.split()) < 6:
         return _fallback_script()
-    spoken_words = spoken.split()
-    if len(spoken_words) > 24:
-        spoken = " ".join(spoken_words[:22]).rstrip(",;:")
-        if spoken.startswith("¿") and not spoken.endswith("?"):
-            spoken += "?"
-        elif not spoken.endswith((".", "!", "?")):
-            spoken += "."
+    spoken = _trim_intro_cleanly(spoken, max_words=17)
 
     raw_phrases = [str(p).strip() for p in (resp.get("phrases") or []) if str(p).strip()]
-    if not raw_phrases or len(raw_phrases) > 4:
+    spoken_norm_toks = _normalize_glossary_token(spoken).split()
+    phrases_norm_toks = _normalize_glossary_token(" ".join(raw_phrases)).split()
+    phrases_match = (
+        bool(raw_phrases)
+        and 1 <= len(raw_phrases) <= 4
+        and spoken_norm_toks == phrases_norm_toks
+    )
+    if not phrases_match:
         raw_phrases = _split_hook_into_phrases(spoken, max_phrases=4)
 
     badge = (ic.badge_text or "").strip() or str(resp.get("badge") or "").strip() or "CONTEXTO CLAVE"
@@ -3757,6 +4300,7 @@ def run_editorial_selection(
     non_speech_intervals: Optional[list[tuple[float, float]]] = None,
     log_cb: Optional[Callable[[str], None]] = None,
     telemetry_cb: Optional[Callable[[dict[str, Any]], None]] = None,
+    catalog_out: Optional[dict[str, Any]] = None,
 ) -> tuple[list[ClipCandidate], list[str], list[dict[str, Any]], dict[str, str], dict[str, Any]]:
     """Run full adaptive editorial v2: block map, glossary/Visual Bible, distinct sub-angle planning & Blind Director audit."""
     if not sentences:
@@ -3830,9 +4374,11 @@ def run_editorial_selection(
 
     global_topic_stopwords = _build_global_entity_stopwords(visual_bible, profile, sentences=sentences)
     already_used_intros: list[str] = []
+    audited_signatures: set[str] = set()
+    rejected_records: list[dict[str, Any]] = []
 
     planned_angles: list[dict[str, Any]] = []
-    if (req_cliffhanger + req_conclusive) >= 2:
+    if (req_cliffhanger + req_conclusive) >= 1:
         if progress_cb:
             progress_cb(36.0, "Planificando sub-ángulos y capítulos completamente distintos...")
         planned_angles = _plan_distinct_episode_angles(
@@ -3879,6 +4425,7 @@ def run_editorial_selection(
         energy_blocks,
         show_speakers,
         blacklisted_indices=blacklisted_indices,
+        visual_bible=visual_bible,
     )
     long_cands = _select_longform_arcs(
         llm,
@@ -3894,6 +4441,7 @@ def run_editorial_selection(
         energy_blocks,
         show_speakers,
         blacklisted_indices=blacklisted_indices,
+        visual_bible=visual_bible,
     )
 
     chosen_long = _deduplicate_and_audit(
@@ -3923,6 +4471,8 @@ def run_editorial_selection(
         global_topic_stopwords=global_topic_stopwords,
         log_cb=log_cb,
         telemetry_cb=telemetry_cb,
+        audited_signatures=audited_signatures,
+        rejected_records=rejected_records,
     )
     long_span_ivs = [(sp.orig_start, sp.orig_end) for c in chosen_long for sp in (c.narrative_spans or [])] or [
         (c.orig_start, c.orig_end) for c in chosen_long
@@ -3954,6 +4504,8 @@ def run_editorial_selection(
         global_topic_stopwords=global_topic_stopwords,
         log_cb=log_cb,
         telemetry_cb=telemetry_cb,
+        audited_signatures=audited_signatures,
+        rejected_records=rejected_records,
     )
     longform_spans = [
         (sp.orig_start, sp.orig_end)
@@ -4115,6 +4667,8 @@ def run_editorial_selection(
         global_topic_stopwords=global_topic_stopwords,
         log_cb=log_cb,
         telemetry_cb=telemetry_cb,
+        audited_signatures=audited_signatures,
+        rejected_records=rejected_records,
     )
     chosen_short_clips.extend(chosen_cliff)
 
@@ -4145,7 +4699,7 @@ def run_editorial_selection(
             assigned_angles=_remaining_angles_for(chosen_short_clips, "short_cliffhanger"),
         )
         more_cliff = _deduplicate_and_audit(
-            [*esc_cliff_cands, *cliff_cands],
+            esc_cliff_cands,
             req_cliffhanger - len(chosen_cliff),
             existing_cliff_ivs,
             longform_spans,
@@ -4173,6 +4727,8 @@ def run_editorial_selection(
             global_topic_stopwords=global_topic_stopwords,
             log_cb=log_cb,
             telemetry_cb=telemetry_cb,
+            audited_signatures=audited_signatures,
+            rejected_records=rejected_records,
         )
         chosen_cliff.extend(more_cliff)
         chosen_short_clips.extend(more_cliff)
@@ -4243,6 +4799,8 @@ def run_editorial_selection(
         global_topic_stopwords=global_topic_stopwords,
         log_cb=log_cb,
         telemetry_cb=telemetry_cb,
+        audited_signatures=audited_signatures,
+        rejected_records=rejected_records,
     )
     chosen_short_clips.extend(chosen_concl)
 
@@ -4277,7 +4835,7 @@ def run_editorial_selection(
             assigned_angles=_remaining_angles_for(chosen_short_clips, "short_conclusive"),
         )
         more_concl = _deduplicate_and_audit(
-            [*esc_concl_cands, *concl_cands],
+            esc_concl_cands,
             req_conclusive - len(chosen_concl),
             existing_concl_ivs,
             longform_spans,
@@ -4305,6 +4863,8 @@ def run_editorial_selection(
             global_topic_stopwords=global_topic_stopwords,
             log_cb=log_cb,
             telemetry_cb=telemetry_cb,
+            audited_signatures=audited_signatures,
+            rejected_records=rejected_records,
         )
         chosen_concl.extend(more_concl)
         chosen_short_clips.extend(more_concl)
@@ -4320,7 +4880,168 @@ def run_editorial_selection(
     all_chosen = [*chosen_cliff, *chosen_concl, *chosen_med, *chosen_long]
     all_chosen.sort(key=lambda c: c.score, reverse=True)
 
+    if catalog_out is not None:
+        chosen_cids = {c.candidate_id for c in all_chosen if c.candidate_id}
+        seen_rej_cids: set[str] = set()
+        dedup_rejected: list[dict[str, Any]] = []
+        for rr in rejected_records:
+            rcid = str(rr.get("candidate_id") or "")
+            if rcid and (rcid in chosen_cids or rcid in seen_rej_cids):
+                continue
+            if rcid:
+                seen_rej_cids.add(rcid)
+            dedup_rejected.append(rr)
+        catalog_out["candidate_pool"] = all_chosen
+        catalog_out["rejected_candidates"] = dedup_rejected
+        catalog_out["planned_angles"] = planned_angles
+
     if progress_cb:
         progress_cb(100.0, f"Selección editorial completada: {len(all_chosen)} vídeos auditados.")
 
     return all_chosen, warnings, block_map, glossary, visual_bible
+
+
+def propose_clip_from_block(
+    block_index: int,
+    clip_type: ClipType,
+    sentences: list[SentenceSegment],
+    energy_blocks: list[dict],
+    silence_intervals: list[tuple[float, float]],
+    profile: PodcasterProfile,
+    llm: OpenRouterClient,
+    visual_bible: Optional[dict[str, Any]] = None,
+    block_map: Optional[list[dict[str, Any]]] = None,
+    blacklisted_indices: Optional[set[int]] = None,
+) -> ClipCandidate:
+    """Create and frame a ready-to-produce ClipCandidate focused on a specific episode block."""
+    if not sentences:
+        raise ValueError("No hay frases transcritas disponibles.")
+
+    id_to_idx = {s.id: i for i, s in enumerate(sentences)}
+    distinct_speakers = {s.speaker for s in sentences if s.speaker}
+    show_speakers = len(distinct_speakers) > 1
+    blocked = blacklisted_indices or set()
+
+    total_duration = sentences[-1].end
+    block_sec = 120.0 if total_duration < 1500.0 else 300.0
+    blocks = build_time_blocks(sentences, energy_blocks, block_sec=block_sec)
+    if not blocks:
+        raise ValueError("No se pudieron construir bloques temporales del episodio.")
+    bi = max(0, min(len(blocks) - 1, int(block_index)))
+
+    # Include block bi plus small surrounding buffer (e.g., for medium/long or payoff finishing in next block)
+    b_cur = blocks[bi]
+    b_start_idx = max(0, id_to_idx.get(b_cur["first_id"], 0) - 12)
+    extra_end = 45 if clip_type in ("medium", "long") else 20
+    b_end_idx = min(len(sentences) - 1, id_to_idx.get(b_cur["last_id"], len(sentences) - 1) + extra_end)
+    excerpt_sents = [sentences[k] for k in range(b_start_idx, b_end_idx + 1) if k not in blocked]
+    if not excerpt_sents:
+        excerpt_sents = sentences[b_start_idx : b_end_idx + 1]
+
+    med_win, long_win, _, _, _ = _resolve_adaptive_windows(total_duration, profile, 1, 1)
+    if clip_type.startswith("short"):
+        aspect = profile.visual.shorts_aspect
+        target_win = DurationWindow(
+            min_sec=max(15.0, profile.quotas.shorts_window.min_sec - 8.0),
+            max_sec=max(35.0, profile.quotas.shorts_window.max_sec - 10.0),
+        )
+        cands = _select_shorts_by_modality(
+            llm=llm,
+            profile=profile,
+            sentences=sentences,
+            id_to_idx=id_to_idx,
+            transcript_excerpt=_format_sentences_block(excerpt_sents, show_speakers=show_speakers, include_durations=True),
+            modality=clip_type,  # type: ignore[arg-type]
+            count=1,
+            window=target_win,
+            silence_intervals=silence_intervals,
+            energy_blocks=energy_blocks,
+            show_speakers=show_speakers,
+            blacklisted_indices=blocked,
+            visual_bible=visual_bible,
+            block_map=block_map,
+            model_role="editorial",
+        )
+    else:
+        aspect = profile.visual.medium_aspect if clip_type == "medium" else profile.visual.long_aspect
+        target_win = med_win if clip_type == "medium" else long_win
+        end_bi = min(len(blocks) - 1, bi + (1 if clip_type == "medium" else 2))
+        b_meta = next((m for m in (block_map or []) if int(m.get("block_index", -1)) == bi), {})
+        cands = _select_longform_arcs(
+            llm=llm,
+            profile=profile,
+            sentences=sentences,
+            id_to_idx=id_to_idx,
+            blocks=blocks,
+            block_map_summaries=[
+                {"block_index": bi, "tema": b_meta.get("tema", f"Bloque {bi}"), "resumen_breve": b_meta.get("resumen_breve", "")}
+            ],
+            clip_type=clip_type,  # type: ignore[arg-type]
+            count=1,
+            window=target_win,
+            silence_intervals=silence_intervals,
+            energy_blocks=energy_blocks,
+            show_speakers=show_speakers,
+            blacklisted_indices=blocked,
+            visual_bible=visual_bible,
+        )
+        if not cands:
+            cands = []
+
+    if not cands:
+        # Deterministic fallback bounded to the chosen block
+        s_i = max(0, id_to_idx.get(b_cur["first_id"], 0))
+        e_i = min(len(sentences) - 1, s_i + 15)
+        adj_s, adj_e, est = adjust_bounds_to_window(s_i, e_i, sentences, target_win, silence_intervals, profile.audio, blacklisted_indices=blocked)
+        b_meta = next((m for m in (block_map or []) if int(m.get("block_index", -1)) == bi), {})
+        title_fb = str(b_meta.get("tema") or f"Historia del bloque B{bi}").strip()
+        cand = ClipCandidate(
+            id=f"{clip_type}_b{bi}_{make_slug(title_fb)[:14]}",
+            candidate_id=f"cand_{uuid.uuid4().hex[:8]}",
+            original_title=title_fb,
+            clip_type=clip_type,
+            aspect_ratio=aspect,
+            score=82,
+            slug=make_slug(title_fb),
+            summary=str(b_meta.get("resumen_breve") or sentences[adj_s].text),
+            start_sentence_id=sentences[adj_s].id,
+            end_sentence_id=sentences[adj_e].id,
+            orig_start=sentences[adj_s].start,
+            orig_end=sentences[adj_e].end,
+            estimated_post_cut_sec=est,
+            narrative_spans=[
+                NarrativeSpan(
+                    start_sentence_id=sentences[adj_s].id,
+                    end_sentence_id=sentences[adj_e].id,
+                    orig_start=sentences[adj_s].start,
+                    orig_end=sentences[adj_e].end,
+                    role="core",
+                )
+            ],
+            metadata=ClipMetadata(titles=[title_fb], description=str(b_meta.get("resumen_breve") or "")),
+        )
+    else:
+        cand = cands[0]
+        if not cand.candidate_id:
+            cand.candidate_id = f"cand_{uuid.uuid4().hex[:8]}"
+        if not cand.original_title:
+            cand.original_title = cand.metadata.titles[0] if cand.metadata.titles else cand.slug
+
+    if profile.intro_curtain.enabled:
+        ic_script = generate_intro_curtain_script(
+            cand,
+            profile,
+            visual_bible or {},
+            llm,
+            sentences=sentences,
+            id_to_idx=id_to_idx,
+        )
+        cand.intro_curtain_enabled = True
+        cand.intro_curtain_text = ic_script["spoken_hook"]
+        cand.intro_curtain_phrases = ic_script["phrases"]
+        cand.intro_curtain_badge = ic_script["badge"]
+
+    cand.user_rescued = True
+    cand.enabled = True
+    cand.output_filename = format_output_filename(cand.score, cand.clip_type, cand.metadata.titles[0] if cand.metadata.titles else cand.slug)
+    return cand

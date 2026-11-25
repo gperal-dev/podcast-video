@@ -411,6 +411,35 @@ def _build_proportional_word_timings(text: str, duration_sec: float) -> list[dic
     return timings
 
 
+def _apply_atempo_wav(wav_path: Path, tempo: float, settings: Settings) -> float:
+    """Apply clean tempo speed-up (<= 1.25x) in-place preserving 44.1kHz stereo PCM WAV."""
+    if not settings.ffmpeg_path:
+        return get_audio_duration(wav_path, settings)
+    safe_t = max(1.01, min(1.25, float(tempo)))
+    tmp_out = wav_path.with_suffix(".tempo.wav")
+    cmd = [
+        str(settings.ffmpeg_path),
+        "-y",
+        "-i",
+        str(wav_path),
+        "-af",
+        f"atempo={safe_t:.4f}",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-c:a",
+        "pcm_s16le",
+        str(tmp_out),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if proc.returncode == 0 and tmp_out.exists() and tmp_out.stat().st_size > 1024:
+        tmp_out.replace(wav_path)
+    elif tmp_out.exists():
+        tmp_out.unlink()
+    return get_audio_duration(wav_path, settings)
+
+
 def synthesize_speech(
     text: str,
     out_wav_path: Path,
@@ -422,6 +451,7 @@ def synthesize_speech(
     settings: Optional[Settings] = None,
     openrouter_client: Any = None,
     trim_silence: bool = True,
+    max_duration_sec: Optional[float] = None,
 ) -> dict[str, Any]:
     """Synthesize Spanish speech with the selected engine and normalize to 44.1kHz stereo WAV."""
     clean_text = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -479,6 +509,55 @@ def synthesize_speech(
 
         if not word_timings:
             word_timings = _build_proportional_word_timings(clean_text, duration_sec)
+
+        # Enforce hard duration ceiling (e.g. max_sec - 0.35s tail pad) when requested
+        if max_duration_sec is not None and max_duration_sec > 1.2:
+            target_speech_max = max(1.0, float(max_duration_sec) - 0.35)
+            if duration_sec > target_speech_max:
+                if engine == "edge_tts" and duration_sec > target_speech_max + 0.55:
+                    # Re-synthesize once at brisker natural rate (+16%) before resorting to atempo
+                    try:
+                        fast_timings = _synthesize_edge_tts(clean_text, voice, "+16%", raw_mp3)
+                        fast_head = max(0.0, float(fast_timings[0]["start"]) - 0.04) if (trim_silence and fast_timings and float(fast_timings[0]["start"]) > 0.06) else 0.0
+                        fast_dur = _normalize_tts_wav(
+                            raw_mp3,
+                            out_wav_path,
+                            target_lufs,
+                            cfg,
+                            trim_silence=trim_silence,
+                            head_trim_sec=fast_head,
+                            has_word_timings=bool(fast_timings),
+                        )
+                        if fast_dur < duration_sec:
+                            duration_sec = fast_dur
+                            if fast_timings:
+                                word_timings = [
+                                    {
+                                        "word": wt["word"],
+                                        "start": max(0.0, round(float(wt["start"]) - fast_head, 3)),
+                                        "end": max(
+                                            max(0.0, round(float(wt["start"]) - fast_head, 3)) + 0.05,
+                                            min(duration_sec, round(float(wt["end"]) - fast_head, 3)),
+                                        ),
+                                    }
+                                    for wt in fast_timings
+                                ]
+                    except Exception:
+                        pass
+                if duration_sec > target_speech_max:
+                    ratio = min(1.25, duration_sec / target_speech_max)
+                    if ratio > 1.01:
+                        old_dur = duration_sec
+                        duration_sec = _apply_atempo_wav(out_wav_path, ratio, cfg)
+                        scale = duration_sec / max(0.1, old_dur)
+                        word_timings = [
+                            {
+                                "word": wt["word"],
+                                "start": round(float(wt["start"]) * scale, 3),
+                                "end": round(float(wt["end"]) * scale, 3),
+                            }
+                            for wt in word_timings
+                        ]
 
         return {
             "wav_path": str(out_wav_path),

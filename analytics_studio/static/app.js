@@ -6,8 +6,108 @@ const state = {
   report: null,
   notesByJob: {},
   selectedClipId: null,
+  selectedArchId: "s1",
   charts: {},
 };
+
+const ARCH_STAGES = [
+  {
+    id: "s1",
+    step: "Etapa 1 · Entrada y Acústica",
+    title: "Audio Original + Escaneo Acústico",
+    file: "backend/core/audio_analyzer.py",
+    svg: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+    summary: "Analiza la onda completa del podcast para detectar silencios largos, huecos sin voz, energía RMS por minuto e interludios musicales.",
+    inputs: ["Archivo MP3/WAV original del podcast", "Umbrales de silencio y música del perfil"],
+    rules: ["Detecta música e intro/outro del podcast por energía y huecos sin voz.", "Genera mapa de energía (alta/media/baja) para puntuar clímax reales."],
+    outputs: ["Lista de silencios", "Intervalos musicales (ej. 180.4s)", "Bloques de energía RMS"],
+    guards: ["No modifica ni recorta el audio original todavía.", "Soporta episodios de 10 minutos hasta >8 horas."],
+  },
+  {
+    id: "s2",
+    step: "Etapa 2 · Transcripción Borrador",
+    title: "Whisper Pasada 1 + Bloqueo de Promos",
+    file: "backend/core/transcriber.py + editorial_engine.py",
+    svg: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>',
+    summary: "Transcribe todo el episodio en local (coste $0) con IDs [S#### | X.Xs], fusiona fragmentos rotos y bloquea anuncios/Patreon/despedidas.",
+    inputs: ["Audio completo + modelo Whisper base", "Reglas regex + bloques de promos"],
+    rules: ["Fusiona fragmentos huérfanos para no partir frases por la mitad.", "Bloquea editorialmente promos de inicio, Patreon, precios y despedidas."],
+    outputs: ["draft_transcript.json (reutilizable como checkpoint)", "Índices bloqueados (blacklist)"],
+    guards: ["Si el trabajo se reintenta, reutiliza draft_transcript.json sin repetir Whisper.", "Tope del 40% para evitar falsos bloqueos masivos."],
+  },
+  {
+    id: "s3",
+    step: "Etapa 3 · Mapa Global",
+    title: "Glosario + Biblia Visual + Planificador de Subtemas",
+    file: "backend/core/editorial_engine.py",
+    svg: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+    summary: "Extrae nombres propios corregidos de Whisper, define la estética histórica y divide el podcast en sub-ángulos independientes.",
+    inputs: ["Muestra uniforme de 120-130 frases del episodio", "Mapa de bloques temáticos"],
+    rules: ["Corrige distorsiones fonéticas de Whisper (ej. 'Rorro y Merlin' -> 'Rolls-Royce Merlin').", "Prohíbe anacronismos visuales (ej. jets modernos en historia WWII) y divide en subtemas distintos."],
+    outputs: ["Glosario aplicado al guion", "Biblia Visual + narrative_spine", "Plan de ángulos A1..A6"],
+    guards: ["Filtra entradas verbosas del glosario para no corromper palabras comunes.", "Consultas de reserva de 2-4 palabras en inglés."],
+  },
+  {
+    id: "s4",
+    step: "Etapa 4 · Selección NLE",
+    title: "Mini-Índice por Vídeo + Selector Multi-Tramo",
+    file: "backend/core/editorial_engine.py",
+    svg: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>',
+    summary: "Para cada vídeo (Short, Medio o Largo), la IA crea un mini-índice propio de ese subtema y elige tramos [S#### | X.Xs] + podas drop_sentence_ids.",
+    inputs: ["Subtemas/bloques asignados + Biblia Visual", "Ventanas de duración (min/max segundos)"],
+    rules: ["Define 3-5 puntos clave propios de ESE vídeo (sin exigir hechos ajenos al subtema).", "Presupuesta la duración sumando [X.Xs] y poda digresiones con drop_sentence_ids."],
+    outputs: ["Candidatos con spans (cold_open, intro, core, payoff)", "video_outline de cada candidato"],
+    guards: ["Bloquea reabsorción de frases podadas en Whisper sin puntos finales.", "Respeta payoff final en ventana (+6s de gracia)."],
+  },
+  {
+    id: "s5",
+    step: "Etapa 5 · Doble Auditoría IA",
+    title: "Verificador de Mini-Índice + Juez Ciego + Edición NLE",
+    file: "backend/core/editorial_engine.py",
+    svg: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
+    summary: "Doble control: el Verificador comprueba que no falte lo más importante de su mini-índice, y el Juez Ciego evalúa como espectador nuevo sin ver el podcast.",
+    inputs: ["Guion literal exacto + mini-índice propio", "Contexto extendido (~200 frases) solo para el Editor NLE"],
+    rules: ["El Juez Ciego NO ve contexto del episodio: comprueba quién, qué, bordes, empalmes y cero spoilers.", "Si falta un punto del mini-índice o contexto inicial, el Editor NLE recorta/extiende/poda o añade Cortinilla IA."],
+    outputs: ["Clips aprobados (100% voz, con Cortinilla IA o rescate)", "Cortinilla IA validada"],
+    guards: ["Escala a modelo experto solo en fallos graves o cuota incompleta.", "Deduplicación semántica anti-clones."],
+  },
+  {
+    id: "s6",
+    step: "Etapa 6 · Audio y Subtítulos",
+    title: "Whisper Pasada 2 + Parche Anti-Huecos + EDL",
+    file: "backend/core/transcriber.py + audio_editor.py",
+    svg: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>',
+    summary: "Alinea palabra por palabra cada tramo, rellena huecos >4s si Whisper Pasada 2 omite voz, corta silencios/músicas con crossfade y sintetiza TTS.",
+    inputs: ["Tramos seleccionados + audio original", "Voz TTS Edge/OpenRouter/Local para cortinillas"],
+    rules: ["Detecta huecos iniciales, internos o finales >4.5s frente a Pasada 1.", "Corta interludios musicales internos y suaviza empalmes con qsin crossfade."],
+    outputs: ["Audio limpio WAV normalizado (-14 LUFS)", "mapped_words 100% sincronizadas"],
+    guards: ["Parche quirúrgico _patch_missing_word_gaps evita que desaparezcan subtítulos tras cortes.", "Limpia palabras colgantes en hook_text."],
+  },
+  {
+    id: "s7",
+    step: "Etapa 7 · Dirección Visual",
+    title: "Storyboard + Stock VLM + Subtítulos ASS",
+    file: "visual_director.py + stock_fetcher.py + subtitle_engine.py",
+    svg: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/></svg>',
+    summary: "Diseña los planos de cada segundo, busca vídeo/foto libre de derechos validada con IA visual (VLM) y genera el guion karaoke .ass.",
+    inputs: ["Palabras alineadas + Biblia Visual", "Proveedores: Pexels, Pixabay, Wikimedia, Archive"],
+    rules: ["Consultas cortas en inglés (2-4 palabras) evitando anacronismos.", "Subtítulos karaoke en zona segura sin solapamientos."],
+    outputs: ["Storyboard completo + caché de stock", "Subtítulos .ass + certificado .licencias.txt"],
+    guards: ["Auditoría estricta de licencias libres.", "Metadatos finales re-generados solo sobre el texto real post-corte."],
+  },
+  {
+    id: "s8",
+    step: "Etapa 8 · Render y Telemetría",
+    title: "Render Final FFmpeg + Analytics Studio",
+    file: "backend/core/video_renderer.py + pipeline.py + analytics_studio/",
+    svg: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>',
+    summary: "Ensambla cortinilla de entrada, vídeo con transiciones y subtítulos quemados, y cortinilla de salida; exporta el informe si está activado.",
+    inputs: ["Storyboard descargado + WAV limpio + ASS + TTS", "Opción save_analytics_report"],
+    rules: ["Deduplica nombres de archivo para evitar colisiones.", "Exporta report.json y mapa de empalmes en analytics_studio/data/ si está activado."],
+    outputs: ["MP4 final (9:16 o 16:9) + JPG miniatura + JSON sidecar", "Informe interactivo en Analytics Studio"],
+    guards: ["Escape seguro de rutas FFmpeg en Windows.", "Telemetría encapsulada en try/except para nunca romper un render."],
+  },
+];
 
 const esc = (v) =>
   String(v ?? "")
@@ -62,6 +162,7 @@ function initTabs() {
     targetTab.scrollIntoView({ block: "nearest", inline: "nearest" });
     if (focusTab) targetTab.focus();
     if (targetTab.id === "tab-compare") renderGlobalComparisonTab();
+    if (targetTab.id === "tab-arch") renderArchitectureTab();
   };
 
   tabs.forEach((tab, idx) => {
@@ -819,6 +920,54 @@ function renderGlobalComparisonTab() {
       </tr>`
     )
     .join("");
+}
+
+function renderArchitectureTab() {
+  const wrap = document.getElementById("arch-diagram");
+  if (!wrap) return;
+
+  wrap.innerHTML = ARCH_STAGES.map((st, idx) => {
+    const active = st.id === state.selectedArchId;
+    const arrow =
+      idx < ARCH_STAGES.length - 1
+        ? `<svg class="arch-arrow" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>`
+        : "";
+    return `
+      <div class="arch-node-wrap" role="listitem">
+        <button type="button" class="arch-node" data-arch-id="${esc(st.id)}" aria-pressed="${active ? "true" : "false"}">
+          <div class="arch-node-head">
+            <span class="arch-icon" aria-hidden="true">${st.svg}</span>
+            <div>
+              <span class="eyebrow" style="margin:0">${esc(st.step)}</span>
+              <strong style="font-size:0.9rem">${esc(st.title)}</strong>
+            </div>
+          </div>
+          <span class="muted" style="font-size:0.78rem">${esc(st.summary.slice(0, 88))}...</span>
+        </button>
+        ${arrow}
+      </div>
+    `;
+  }).join("");
+
+  wrap.querySelectorAll("[data-arch-id]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.selectedArchId = btn.dataset.archId;
+      renderArchitectureTab();
+    });
+  });
+
+  const cur = ARCH_STAGES.find((s) => s.id === state.selectedArchId) || ARCH_STAGES[0];
+  document.getElementById("arch-step-badge").textContent = cur.step;
+  document.getElementById("arch-step-title").textContent = cur.title;
+  document.getElementById("arch-step-file").textContent = cur.file;
+  document.getElementById("arch-step-summary").textContent = cur.summary;
+  const fillList = (id, items) => {
+    document.getElementById(id).innerHTML = items.map((x) => `<li>${esc(x)}</li>`).join("");
+  };
+  fillList("arch-step-inputs", cur.inputs);
+  fillList("arch-step-rules", cur.rules);
+  fillList("arch-step-outputs", cur.outputs);
+  fillList("arch-step-guards", cur.guards);
 }
 
 function renderLogs() {

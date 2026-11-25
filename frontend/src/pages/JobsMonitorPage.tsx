@@ -13,6 +13,7 @@ import {
   Square,
 } from "lucide-react";
 import { api, clipTypeLabel, formatDuration } from "../api/client";
+import { TopicSelectionPanel } from "../components/TopicSelectionPanel";
 import type { ClipCandidate, JobState, PodcasterProfile } from "../types";
 
 interface JobsMonitorPageProps {
@@ -28,6 +29,7 @@ interface JobsMonitorPageProps {
 const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
   queued: { label: "En cola", cls: "bg-slate-100 text-slate-700" },
   running: { label: "En proceso", cls: "bg-indigo-100 text-indigo-800" },
+  awaiting_topic_selection: { label: "Elegir temas (Semi-Auto)", cls: "bg-indigo-100 text-indigo-900" },
   awaiting_review: { label: "Esperando revisión", cls: "bg-amber-100 text-amber-900" },
   completed: { label: "Completado", cls: "bg-emerald-100 text-emerald-800" },
   failed: { label: "Interrumpido", cls: "bg-rose-100 text-rose-800" },
@@ -51,6 +53,10 @@ export function JobsMonitorPage({
   const [reviewDraft, setReviewDraft] = useState<ClipCandidate[]>([]);
   const [savingReview, setSavingReview] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [logFilter, setLogFilter] = useState<"all" | "info" | "warning" | "error" | "llm">("all");
+  const [hideHeartbeat, setHideHeartbeat] = useState(true);
+  const [logSearch, setLogSearch] = useState("");
+  const [downloadingLogs, setDownloadingLogs] = useState(false);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -188,7 +194,10 @@ export function JobsMonitorPage({
             </div>
 
             <div className="flex items-center gap-2">
-              {(activeJob.status === "running" || activeJob.status === "queued") && (
+              {(activeJob.status === "running" ||
+                activeJob.status === "queued" ||
+                activeJob.status === "awaiting_topic_selection" ||
+                activeJob.status === "awaiting_review") && (
                 <button
                   type="button"
                   onClick={async () => onJobUpdated(await api.cancelJob(activeJob.job_id))}
@@ -275,6 +284,12 @@ export function JobsMonitorPage({
                     : ph.status === "failed"
                       ? "bg-rose-500"
                       : "bg-slate-300";
+              const liveElapsed =
+                ph.status === "running" && ph.started_at
+                  ? Math.max(0, Math.round((nowMs - Date.parse(ph.started_at)) / 1000))
+                  : ph.duration_sec != null
+                    ? Math.round(ph.duration_sec)
+                    : null;
               return (
                 <div key={ph.phase} className={`rounded-xl border p-2.5 text-xs ${color}`}>
                   <div className="flex items-center justify-between gap-1 font-semibold">
@@ -287,9 +302,27 @@ export function JobsMonitorPage({
                       style={{ width: `${Math.min(100, Math.max(0, barPct))}%` }}
                     />
                   </div>
-                  <div className="mt-1.5 truncate text-[11px] opacity-85" title={ph.detail}>
-                    {ph.status === "completed" ? "Listo (100%)" : ph.detail || `${ph.progress_pct.toFixed(0)}%`}
+                  <div
+                    className="mt-1.5 truncate text-[11px] opacity-85"
+                    title={ph.substep || ph.detail}
+                  >
+                    {ph.status === "completed"
+                      ? "Listo (100%)"
+                      : ph.substep || ph.detail || `${ph.progress_pct.toFixed(0)}%`}
                   </div>
+                  {(liveElapsed != null || (ph.items_total ?? 0) > 0 || (ph.status === "running" && ph.eta_sec)) && (
+                    <div className="mt-1 flex flex-wrap items-center justify-between gap-1 text-[10px] opacity-75">
+                      <span>{liveElapsed != null ? formatDuration(liveElapsed) : ""}</span>
+                      {(ph.items_total ?? 0) > 0 && (
+                        <span>
+                          {ph.items_done ?? 0}/{ph.items_total}
+                        </span>
+                      )}
+                      {ph.status === "running" && ph.eta_sec && ph.eta_sec > 2 ? (
+                        <span>ETA ~{formatDuration(ph.eta_sec)}</span>
+                      ) : null}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -323,20 +356,61 @@ export function JobsMonitorPage({
                   Desglose por modelo
                 </div>
                 <div className="max-h-28 space-y-1 overflow-y-auto pr-1 text-[11px]">
-                  {Object.values(activeJob.cost.by_model).map((rec) => (
-                    <div key={rec.model} className="flex items-center justify-between gap-2 text-slate-700">
-                      <span className="truncate font-mono">{rec.model}</span>
-                      <span className="shrink-0 font-medium">
-                        {rec.calls}x • {rec.total_tokens.toLocaleString()} tok • ${rec.cost_usd.toFixed(4)}
-                      </span>
-                    </div>
-                  ))}
+                  {Object.values(activeJob.cost.by_model).map((rec) => {
+                    const avgLat =
+                      rec.calls > 0 && rec.total_latency_sec ? rec.total_latency_sec / rec.calls : null;
+                    return (
+                      <div key={rec.model} className="flex items-center justify-between gap-2 text-slate-700">
+                        <span className="truncate font-mono">{rec.model}</span>
+                        <span className="shrink-0 font-medium">
+                          {rec.calls}x • {rec.total_tokens.toLocaleString()} tok • ${rec.cost_usd.toFixed(4)}
+                          {avgLat != null ? ` • ${avgLat.toFixed(1)}s` : ""}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
           </div>
         </div>
       </div>
+
+      {/* Live Metrics & Judge Funnel Strip */}
+      {(activeJob.live_metrics && Object.keys(activeJob.live_metrics).length > 0) && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+          <div className="rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-xs shadow-sm">
+            <div className="text-[11px] font-semibold text-slate-500">Juez Ciego</div>
+            <div className="mt-0.5 text-sm font-bold text-slate-900">
+              {Number(activeJob.live_metrics.judge_accepted ?? 0)}/{Number(activeJob.live_metrics.judge_evaluated ?? 0)} aprobados
+            </div>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-xs shadow-sm">
+            <div className="text-[11px] font-semibold text-slate-500">Descartados</div>
+            <div className="mt-0.5 text-sm font-bold text-amber-700">
+              {Number(activeJob.live_metrics.judge_rejected ?? 0)} candidatos
+            </div>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-xs shadow-sm">
+            <div className="text-[11px] font-semibold text-slate-500">Llamadas LLM</div>
+            <div className="mt-0.5 text-sm font-bold text-slate-900">
+              {activeJob.cost.total_calls} ({Number(activeJob.live_metrics.llm_fallbacks ?? 0)} fallbacks)
+            </div>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-xs shadow-sm">
+            <div className="text-[11px] font-semibold text-slate-500">Glosario episodio</div>
+            <div className="mt-0.5 text-sm font-bold text-emerald-700">
+              {Object.keys(activeJob.episode_glossary || {}).length} términos
+            </div>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-xs shadow-sm">
+            <div className="text-[11px] font-semibold text-slate-500">Modo</div>
+            <div className="mt-0.5 text-sm font-bold text-indigo-700">
+              {activeJob.execution_mode || (activeJob.auto_mode ? "auto" : "review")}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Warnings or Error */}
       {activeJob.warnings.length > 0 && (
@@ -356,6 +430,11 @@ export function JobsMonitorPage({
         <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800">
           <strong>Error:</strong> {activeJob.error_message}
         </div>
+      )}
+
+      {/* Semi-Auto Topic Selection Panel */}
+      {activeJob.status === "awaiting_topic_selection" && (
+        <TopicSelectionPanel job={activeJob} onJobUpdated={onJobUpdated} onAnnounce={onAnnounce} />
       )}
 
       {/* Review Mode Cards */}
@@ -696,34 +775,111 @@ export function JobsMonitorPage({
 
       {/* Live SSE Log Console */}
       <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4 text-slate-100 shadow-sm">
-        <div className="mb-2 flex items-center justify-between text-xs font-semibold text-slate-400">
-          <span>Registro de actividad en tiempo real</span>
-          {activeJob.status === "completed" && (
-            <span className="inline-flex items-center gap-1 text-emerald-400">
-              <Check className="h-3.5 w-3.5" aria-hidden="true" /> Todo terminado
-            </span>
-          )}
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-slate-300">Registro de actividad en tiempo real</span>
+            {activeJob.status === "completed" && (
+              <span className="inline-flex items-center gap-1 text-emerald-400">
+                <Check className="h-3.5 w-3.5" aria-hidden="true" /> Todo terminado
+              </span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            {(
+              [
+                ["all", "Todos"],
+                ["llm", "LLM"],
+                ["warning", "Avisos"],
+                ["error", "Errores"],
+              ] as const
+            ).map(([fk, fl]) => (
+              <button
+                key={fk}
+                type="button"
+                onClick={() => setLogFilter(fk)}
+                className={`rounded-md px-2 py-1 text-[11px] font-semibold transition ${
+                  logFilter === fk
+                    ? "bg-indigo-600 text-white"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                }`}
+              >
+                {fl}
+              </button>
+            ))}
+            <label className="ml-1 inline-flex cursor-pointer items-center gap-1 rounded-md bg-slate-800 px-2 py-1 text-[11px] text-slate-300">
+              <input
+                type="checkbox"
+                checked={hideHeartbeat}
+                onChange={(e) => setHideHeartbeat(e.target.checked)}
+                className="h-3 w-3 accent-indigo-500"
+              />
+              <span>Ocultar latidos</span>
+            </label>
+            <input
+              type="search"
+              placeholder="Filtrar texto..."
+              value={logSearch}
+              onChange={(e) => setLogSearch(e.target.value)}
+              className="w-36 rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-200 placeholder-slate-500"
+            />
+            <button
+              type="button"
+              disabled={downloadingLogs}
+              onClick={async () => {
+                setDownloadingLogs(true);
+                try {
+                  const res = await api.getJobLogs(activeJob.job_id);
+                  const blob = new Blob([JSON.stringify(res.events, null, 2)], { type: "application/json" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `${activeJob.job_id}_logs.json`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                } finally {
+                  setDownloadingLogs(false);
+                }
+              }}
+              className="inline-flex items-center gap-1 rounded-md bg-slate-800 px-2 py-1 text-[11px] font-semibold text-slate-200 hover:bg-slate-700"
+            >
+              <Download className="h-3 w-3" aria-hidden="true" /> Log completo
+            </button>
+          </div>
         </div>
         <div ref={logsContainerRef} className="max-h-80 space-y-1 overflow-y-auto font-mono text-xs">
-          {activeJob.logs.slice(-200).map((log, i) => (
-            <div
-              key={i}
-              className={
-                log.level === "error"
-                  ? "text-rose-400"
-                  : log.level === "warning"
-                    ? "text-amber-300"
-                    : log.message.startsWith("[Latido]")
-                      ? "text-cyan-300"
-                      : log.message.startsWith("LLM ")
-                        ? "text-emerald-300"
-                        : "text-slate-200"
+          {activeJob.logs
+            .filter((log) => {
+              if (hideHeartbeat && log.message.startsWith("[Latido]")) return false;
+              if (logFilter === "llm" && !log.message.startsWith("LLM ")) return false;
+              if (logFilter === "warning" && log.level !== "warning") return false;
+              if (logFilter === "error" && log.level !== "error") return false;
+              if (logFilter === "info" && log.level !== "info") return false;
+              if (logSearch.trim() && !log.message.toLowerCase().includes(logSearch.trim().toLowerCase())) {
+                return false;
               }
-            >
-              <span className="mr-2 text-slate-500">{log.ts.slice(11, 19)}</span>
-              {log.message}
-            </div>
-          ))}
+              return true;
+            })
+            .slice(-300)
+            .map((log, i) => (
+              <div
+                key={i}
+                className={
+                  log.level === "error"
+                    ? "text-rose-400"
+                    : log.level === "warning"
+                      ? "text-amber-300"
+                      : log.message.startsWith("[Latido]")
+                        ? "text-cyan-300"
+                        : log.message.startsWith("LLM ")
+                          ? "text-emerald-300"
+                          : "text-slate-200"
+                }
+              >
+                <span className="mr-2 text-slate-500">{log.ts.slice(11, 19)}</span>
+                {log.message}
+              </div>
+            ))}
         </div>
       </div>
     </div>

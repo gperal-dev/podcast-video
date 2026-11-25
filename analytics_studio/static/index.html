@@ -35,6 +35,9 @@
         <button type="button" role="tab" id="tab-compare" aria-selected="false">
           Comparativa General (Todas las Pruebas)
         </button>
+        <button type="button" role="tab" id="tab-arch" aria-selected="false">
+          Cadena de Trabajo (Cómo Funciona)
+        </button>
       </div>
     </div>
 
@@ -290,6 +293,55 @@
                 </thead>
                 <tbody id="history-tbody"></tbody>
               </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- TAB 3: INTERACTIVE SVG PIPELINE ARCHITECTURE -->
+      <section role="tabpanel" id="panel-arch" aria-labelledby="tab-arch" hidden>
+        <div class="panel-inner space-y-lg">
+          <section class="card card-elevated" aria-labelledby="arch-title">
+            <div class="card-head wrap">
+              <div>
+                <h2 id="arch-title">Cadena de Trabajo Completa (Del Audio Original al Vídeo Final)</h2>
+                <p class="muted">
+                  Pulsa sobre cualquier etapa del flujo para inspeccionar qué hace exactamente, qué reglas sigue la IA y qué archivos del proyecto la ejecutan.
+                </p>
+              </div>
+              <span class="pill pill-blue">8 Etapas Conectadas</span>
+            </div>
+
+            <div id="arch-diagram" class="arch-diagram" role="list" aria-label="Diagrama de flujo del sistema"></div>
+          </section>
+
+          <section class="card" id="arch-inspector" aria-live="polite">
+            <div class="card-head wrap">
+              <div>
+                <span class="eyebrow" id="arch-step-badge">Etapa 1 de 8</span>
+                <h2 id="arch-step-title">Selecciona una etapa arriba</h2>
+              </div>
+              <code class="pill" id="arch-step-file">--</code>
+            </div>
+            <p id="arch-step-summary" class="muted" style="font-size:0.96rem;margin-bottom:1rem"></p>
+
+            <div class="arch-detail-grid">
+              <div class="subcard">
+                <h3>Entradas que recibe</h3>
+                <ul id="arch-step-inputs" class="clean-list"></ul>
+              </div>
+              <div class="subcard">
+                <h3>Instrucciones / Reglas clave de la IA</h3>
+                <ul id="arch-step-rules" class="clean-list"></ul>
+              </div>
+              <div class="subcard">
+                <h3>Salidas que produce</h3>
+                <ul id="arch-step-outputs" class="clean-list"></ul>
+              </div>
+              <div class="subcard">
+                <h3>Salvaguardas anti-fallos</h3>
+                <ul id="arch-step-guards" class="clean-list"></ul>
+              </div>
             </div>
           </section>
         </div>

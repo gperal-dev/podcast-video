@@ -57,6 +57,7 @@ class CostTracker:
         prompt_tokens: int,
         completion_tokens: int,
         cost_usd: float,
+        latency_sec: float = 0.0,
     ) -> None:
         with self._lock:
             total_tok = prompt_tokens + completion_tokens
@@ -76,6 +77,7 @@ class CostTracker:
             rec.completion_tokens += completion_tokens
             rec.total_tokens += total_tok
             rec.cost_usd = round(rec.cost_usd + cost_usd, 6)
+            rec.total_latency_sec = round(rec.total_latency_sec + max(0.0, float(latency_sec)), 3)
 
     def snapshot(self) -> CostMetrics:
         with self._lock:
@@ -114,6 +116,32 @@ def _parse_json_lenient(raw_text: str) -> dict[str, Any]:
             pass
 
     raise TransientOpenRouterError(f"JSON inválido recibido del modelo: {text[:240]}")
+
+
+def _summarize_json_response(parsed: dict[str, Any], max_len: int = 240) -> str:
+    """Build a compact non-sensitive preview of a parsed LLM JSON response for telemetry logs."""
+    try:
+        parts: list[str] = []
+        for k, v in parsed.items():
+            if isinstance(v, list):
+                parts.append(f"{k}=[{len(v)}]")
+            elif isinstance(v, dict):
+                parts.append(f"{k}={{{len(v)}}}")
+            elif isinstance(v, bool):
+                parts.append(f"{k}={v}")
+            elif isinstance(v, (int, float)):
+                parts.append(f"{k}={v}")
+            else:
+                s = " ".join(str(v or "").split())
+                if len(s) > 48:
+                    s = s[:45] + "..."
+                parts.append(f"{k}={s!r}")
+            if sum(len(p) for p in parts) >= max_len:
+                break
+        summary = ", ".join(parts)
+        return summary[:max_len] if len(summary) > max_len else summary
+    except Exception:
+        return ""
 
 
 class OpenRouterClient:
@@ -285,6 +313,8 @@ class OpenRouterClient:
         user_content: Any,
         temperature: float,
         max_tokens: int,
+        role: str = "",
+        stage: str = "",
     ) -> dict[str, Any]:
         self._raise_if_cancelled()
         messages = [
@@ -329,18 +359,23 @@ class OpenRouterClient:
                     p_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
                     c_tok = int(getattr(usage, "completion_tokens", 0) or 0)
                     cost = self._estimate_cost(model, p_tok, c_tok, usage)
-                    self.cost_tracker.record(model, p_tok, c_tok, cost)
+                    self.cost_tracker.record(model, p_tok, c_tok, cost, latency_sec=elapsed_s)
+                    preview = _summarize_json_response(parsed)
+                    stage_tag = stage or role
                     if self._telemetry_cb is not None:
                         try:
                             self._telemetry_cb(
                                 {
                                     "type": "llm_call",
                                     "model": model,
+                                    "role": role,
+                                    "stage": stage_tag,
                                     "prompt_tokens": p_tok,
                                     "completion_tokens": c_tok,
                                     "cost_usd": round(cost, 6),
                                     "duration_sec": round(elapsed_s, 3),
                                     "finish_reason": str(finish_reason or ""),
+                                    "response_preview": preview,
                                     "ts": datetime.now(timezone.utc).isoformat(),
                                 }
                             )
@@ -348,8 +383,9 @@ class OpenRouterClient:
                             pass
                     if self._call_log_cb is not None:
                         try:
+                            tag_suffix = f" | {elapsed_s:.1f}s [{stage_tag}]" if stage_tag else f" | {elapsed_s:.1f}s"
                             self._call_log_cb(
-                                f"LLM {model}: {p_tok:,} in / {c_tok:,} out (${cost:.5f})"
+                                f"LLM {model}: {p_tok:,} in / {c_tok:,} out (${cost:.5f}){tag_suffix}"
                             )
                         except Exception:
                             pass
@@ -382,6 +418,7 @@ class OpenRouterClient:
         max_tokens: int,
         err_prefix: str,
         vision: bool = False,
+        stage: str = "",
     ) -> dict[str, Any]:
         models = self._candidate_models(role, vision=vision)
         last_error: Optional[Exception] = None
@@ -394,6 +431,8 @@ class OpenRouterClient:
                     user_content=user_content,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    role=role,
+                    stage=stage,
                 )
             except Exception as exc:
                 self._raise_if_cancelled()
@@ -407,6 +446,7 @@ class OpenRouterClient:
                             {
                                 "type": "llm_fallback",
                                 "role": role,
+                                "stage": stage or role,
                                 "from_model": model,
                                 "to_model": models[idx_m + 1],
                                 "error": str(exc)[:300],
@@ -432,6 +472,7 @@ class OpenRouterClient:
         user_prompt: str,
         temperature: float = 0.2,
         max_tokens: int = 4096,
+        stage: str = "",
     ) -> dict[str, Any]:
         """Execute a strict-JSON chat completion with model fallback on unavailability."""
         return self._execute_with_fallback(
@@ -442,6 +483,7 @@ class OpenRouterClient:
             max_tokens=max_tokens,
             err_prefix="Todos los modelos fallaron para rol",
             vision=False,
+            stage=stage,
         )
 
     def chat_vision_json(
@@ -452,6 +494,7 @@ class OpenRouterClient:
         image_jpegs: list[bytes],
         temperature: float = 0.1,
         max_tokens: int = 1024,
+        stage: str = "",
     ) -> dict[str, Any]:
         """Execute a multimodal vision + text JSON call using base64 JPEG data URLs."""
         content_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
@@ -475,4 +518,5 @@ class OpenRouterClient:
             max_tokens=max_tokens,
             err_prefix="Todos los modelos vision fallaron para rol",
             vision=True,
+            stage=stage,
         )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from backend.core.transcriber import (
     _merge_orphan_fragments,
+    _patch_missing_word_gaps,
     _split_segment_into_sentences,
     detect_pass2_hallucination,
 )
@@ -104,3 +105,78 @@ def test_detect_pass2_hallucination_patterns() -> None:
         reference_text=clean_text,
     )
     assert bad_clean is False
+
+
+def test_pass2_leading_trailing_gap_detection_and_surgical_patch() -> None:
+    """Reproduces the 38s missing-subtitle drop on medium_01 and verifies surgical patching."""
+    ref_sents = [
+        SentenceSegment(
+            id="S0200",
+            start=1642.0,
+            end=1660.0,
+            text="Rolls Royce no quería reconocer que su motor Merlin tenía un fallo crítico en picado.",
+        ),
+        SentenceSegment(
+            id="S0201",
+            start=1660.2,
+            end=1679.0,
+            text="Todos los expedientes militares quedaron clasificados y ocultos al público hasta 1970.",
+        ),
+        SentenceSegment(
+            id="S0202",
+            start=1680.0,
+            end=1695.0,
+            text="En 1948 el rey Jorge de Inglaterra le concedió la Orden del Imperio Británico.",
+        ),
+    ]
+    # Simulate Whisper Pass 2 skipping the entire first 38s [1642..1680] while keeping [1680..1695]
+    pass2_partial = [
+        WordTimestamp(word=w, start=1680.0 + i * 1.05, end=1680.8 + i * 1.05, probability=0.9)
+        for i, w in enumerate(ref_sents[2].text.split())
+    ]
+    bad, reason = detect_pass2_hallucination(
+        pass2_partial,
+        span_duration=53.0,
+        reference_text=" ".join(s.text for s in ref_sents),
+        clip_start=1642.0,
+        clip_end=1695.0,
+        reference_sentences=ref_sents,
+    )
+    assert bad is True
+    assert ("hueco inicial" in reason) or ("caída de cobertura" in reason)
+
+    dense_ref = ref_sents + [
+        SentenceSegment(
+            id="S0203",
+            start=1695.0,
+            end=1740.0,
+            text=" ".join(f"palabra{i}" for i in range(45)),
+        )
+    ]
+    dense_pass2 = [
+        WordTimestamp(word=w, start=1680.0 + i * 0.5, end=1680.3 + i * 0.5, probability=0.9)
+        for i, w in enumerate((ref_sents[2].text + " " + dense_ref[3].text).split())
+    ]
+    bad_d, reason_d = detect_pass2_hallucination(
+        dense_pass2,
+        span_duration=98.0,
+        reference_text=" ".join(s.text for s in dense_ref),
+        clip_start=1642.0,
+        clip_end=1740.0,
+        reference_sentences=dense_ref,
+    )
+    assert bad_d is True
+    assert "hueco inicial" in reason_d
+
+    patched_words, count = _patch_missing_word_gaps(
+        pass2_partial,
+        clip_start=1642.0,
+        clip_end=1695.0,
+        reference_sentences=ref_sents,
+        min_gap_sec=4.0,
+    )
+    assert count == 1
+    assert patched_words[0].start < 1645.0
+    assert "Rolls" in " ".join(w.word for w in patched_words[:5])
+    assert "Jorge" in " ".join(w.word for w in patched_words[-10:])
+

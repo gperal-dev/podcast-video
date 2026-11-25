@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -62,13 +63,20 @@ def _run_ffmpeg_with_fallback(
     preferred_encoder: str,
     threads: int,
     timeout_sec: int = 180,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+    expected_duration_sec: float = 0.0,
+    progress_range: tuple[float, float] = (0.0, 100.0),
+    progress_label: str = "Renderizando vídeo...",
 ) -> None:
-    """Execute FFmpeg encode with preferred HW encoder, timeout protection, and automatic fallback to libx264."""
+    """Execute FFmpeg encode with preferred HW encoder, optional real progress streaming, and libx264 fallback."""
     encoders_to_try = [preferred_encoder]
     if preferred_encoder != "libx264":
         encoders_to_try.append("libx264")
 
     last_err = ""
+    use_pipe = progress_cb is not None and expected_duration_sec > 0.5
+    p_lo, p_hi = progress_range
+
     for enc in encoders_to_try:
         cmd = [
             str(ffmpeg_path),
@@ -84,21 +92,85 @@ def _run_ffmpeg_with_fallback(
             "yuv420p",
             *output_args,
         ]
+        if not use_pipe:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=max(30, int(timeout_sec)),
+                    **_low_priority_kwargs(),
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    return
+                last_err = proc.stderr.strip()
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(f"FFmpeg agotó el tiempo límite ({timeout_sec}s) con codificador {enc}.") from exc
+            continue
+
+        # Stream `-progress pipe:1` while collecting stderr for accurate live progress bars
+        pipe_cmd = [
+            str(ffmpeg_path),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            "-y",
+            "-threads",
+            str(threads),
+            *base_args,
+            *_encoder_args(enc),
+            "-pix_fmt",
+            "yuv420p",
+            *output_args,
+        ]
+        proc_p = subprocess.Popen(
+            pipe_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_low_priority_kwargs(),
+        )
+        t_start = time.monotonic()
+        last_emit = 0.0
+        max_wait = max(30, int(timeout_sec))
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=max(30, int(timeout_sec)),
-                **_low_priority_kwargs(),
-                check=False,
-            )
-            if proc.returncode == 0:
+            assert proc_p.stdout is not None
+            for raw_line in proc_p.stdout:
+                if time.monotonic() - t_start > max_wait:
+                    proc_p.kill()
+                    raise RuntimeError(f"FFmpeg agotó el tiempo límite ({timeout_sec}s) con codificador {enc}.")
+                line = raw_line.strip()
+                if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                    val_str = line.split("=", 1)[1].strip()
+                    try:
+                        us = float(val_str)
+                    except ValueError:
+                        continue
+                    cur_s = us / 1_000_000.0
+                    frac = max(0.0, min(1.0, cur_s / max(0.5, expected_duration_sec)))
+                    now_m = time.monotonic()
+                    if now_m - last_emit >= 1.2:
+                        last_emit = now_m
+                        pct = p_lo + (p_hi - p_lo) * frac
+                        if progress_cb is not None:
+                            progress_cb(pct, f"{progress_label} ({frac * 100:.0f}%)")
+            ret = proc_p.wait(timeout=max(5, int(max_wait - (time.monotonic() - t_start))))
+            stderr_txt = proc_p.stderr.read() if proc_p.stderr else ""
+            if ret == 0:
+                if progress_cb is not None:
+                    progress_cb(p_hi, f"{progress_label} (100%)")
                 return
-            last_err = proc.stderr.strip()
+            last_err = stderr_txt.strip()
         except subprocess.TimeoutExpired as exc:
+            proc_p.kill()
             raise RuntimeError(f"FFmpeg agotó el tiempo límite ({timeout_sec}s) con codificador {enc}.") from exc
 
     raise RuntimeError(f"FFmpeg falló al renderizar vídeo: {last_err[:500]}")
@@ -309,9 +381,9 @@ def _render_single_shot(
 
         # Fullscreen Ken Burns (also used for outro_cta)
         pre_png = temp_dir / f"{shot.id}_pre.png"
-        _prepare_prescaled_image(custom_image_path, pre_png, int(width * 1.2), int(height * 1.2))
+        _prepare_prescaled_image(custom_image_path, pre_png, int(width * 1.12), int(height * 1.12))
         vf = (
-            f"zoompan=z='min(zoom+0.0009,1.14)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            f"zoompan=z='min(zoom+0.0008,1.10)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
             f"d={frames}:s={width}x{height}:fps=30,setsar=1"
         )
         _run_ffmpeg_with_fallback(
@@ -327,9 +399,9 @@ def _render_single_shot(
     if media_path and media_path.exists():
         if media_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}:
             pre_png = temp_dir / f"{shot.id}_stock.png"
-            _prepare_prescaled_image(media_path, pre_png, int(width * 1.2), int(height * 1.2))
+            _prepare_prescaled_image(media_path, pre_png, int(width * 1.12), int(height * 1.12))
             vf = (
-                f"zoompan=z='min(zoom+0.0008,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                f"zoompan=z='min(zoom+0.0007,1.10)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
                 f"d={frames}:s={width}x{height}:fps=30,setsar=1"
             )
             _run_ffmpeg_with_fallback(
@@ -1272,6 +1344,8 @@ def _render_intro_curtain_block(
             f"[{a_out_lbl}]",
             "-r",
             "30",
+            "-video_track_timescale",
+            "30000",
             "-t",
             f"{dur_sec:.3f}",
             "-c:a",
@@ -1652,6 +1726,10 @@ def render_final_video(
                 encoder,
                 cfg.ffmpeg_threads,
                 timeout_sec=480,
+                progress_cb=progress_cb,
+                expected_duration_sec=body_dur,
+                progress_range=(75.0, 93.0),
+                progress_label="Aplicando subtítulos y mezcla final",
             )
             if progress_cb:
                 progress_cb(94.0, "Seleccionando mejor miniatura local...")
@@ -1857,6 +1935,8 @@ def render_final_video(
                 f"[{a_bo_lbl}]",
                 "-r",
                 "30",
+                "-video_track_timescale",
+                "30000",
                 "-t",
                 f"{total_bo_dur:.3f}",
                 "-c:a",
@@ -1872,7 +1952,16 @@ def render_final_video(
                 bo_out_args.extend(["-movflags", "+faststart"])
             bo_out_args.append(str(body_outro_mp4))
             _run_ffmpeg_with_fallback(
-                cfg.ffmpeg_path, inputs, bo_out_args, encoder, cfg.ffmpeg_threads, timeout_sec=480
+                cfg.ffmpeg_path,
+                inputs,
+                bo_out_args,
+                encoder,
+                cfg.ffmpeg_threads,
+                timeout_sec=480,
+                progress_cb=progress_cb,
+                expected_duration_sec=total_bo_dur,
+                progress_range=(75.0, 86.0 if use_intro_curtain else 93.0),
+                progress_label="Aplicando subtítulos, cierre y mezcla final",
             )
 
             intro_dur_actual = 0.0
@@ -1895,39 +1984,85 @@ def render_final_video(
                     bg_image_path=ic_bg_img,
                 )
                 intro_dur_actual = float(clip.intro_curtain_duration_sec or profile.intro_curtain.min_sec)
-                concat_fc = (
-                    f"[0:v]fps=30,scale={width}:{height},setsar=1,format=yuv420p[iv];"
-                    f"[1:v]fps=30,scale={width}:{height},setsar=1,format=yuv420p[bv];"
-                    "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ia];"
-                    "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ba];"
-                    "[iv][ia][bv][ba]concat=n=2:v=1:a=1[vfinal_all][afinal_all]"
+                expected_final_dur = intro_dur_actual + total_bo_dur
+
+                # Try zero-CPU stream-copy concat first (both parts share encoder, 30fps, timescale 30000, 48kHz AAC)
+                concat_ib = tmp_dir / "concat_intro_body.txt"
+                concat_ib.write_text(
+                    f"file '{intro_mp4.resolve().as_posix()}'\nfile '{body_outro_mp4.resolve().as_posix()}'\n",
+                    encoding="utf-8",
                 )
-                _run_ffmpeg_with_fallback(
-                    cfg.ffmpeg_path,
-                    ["-i", str(intro_mp4), "-i", str(body_outro_mp4)],
+                copy_ok = False
+                copy_proc = subprocess.run(
                     [
-                        "-filter_complex",
-                        concat_fc,
-                        "-map",
-                        "[vfinal_all]",
-                        "-map",
-                        "[afinal_all]",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "192k",
-                        "-ar",
-                        "48000",
-                        "-ac",
-                        "2",
+                        str(cfg.ffmpeg_path),
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(concat_ib),
+                        "-c",
+                        "copy",
                         "-movflags",
                         "+faststart",
                         str(output_mp4),
                     ],
-                    encoder,
-                    cfg.ffmpeg_threads,
-                    timeout_sec=480,
+                    capture_output=True,
+                    text=True,
+                    **_low_priority_kwargs(),
+                    check=False,
                 )
+                if copy_proc.returncode == 0 and output_mp4.exists() and output_mp4.stat().st_size > 4096:
+                    try:
+                        probed_cp = get_audio_duration(output_mp4, cfg)
+                        if abs(probed_cp - expected_final_dur) <= 0.45:
+                            copy_ok = True
+                    except Exception:
+                        pass
+
+                if not copy_ok:
+                    concat_fc = (
+                        f"[0:v]fps=30,scale={width}:{height},setsar=1,format=yuv420p[iv];"
+                        f"[1:v]fps=30,scale={width}:{height},setsar=1,format=yuv420p[bv];"
+                        "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ia];"
+                        "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ba];"
+                        "[iv][ia][bv][ba]concat=n=2:v=1:a=1[vfinal_all][afinal_all]"
+                    )
+                    _run_ffmpeg_with_fallback(
+                        cfg.ffmpeg_path,
+                        ["-i", str(intro_mp4), "-i", str(body_outro_mp4)],
+                        [
+                            "-filter_complex",
+                            concat_fc,
+                            "-map",
+                            "[vfinal_all]",
+                            "-map",
+                            "[afinal_all]",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "192k",
+                            "-ar",
+                            "48000",
+                            "-ac",
+                            "2",
+                            "-movflags",
+                            "+faststart",
+                            str(output_mp4),
+                        ],
+                        encoder,
+                        cfg.ffmpeg_threads,
+                        timeout_sec=480,
+                        progress_cb=progress_cb,
+                        expected_duration_sec=expected_final_dur,
+                        progress_range=(87.0, 93.0),
+                        progress_label="Ensamblando cortinilla y vídeo final",
+                    )
 
             final_dur = intro_dur_actual + total_bo_dur
             try:

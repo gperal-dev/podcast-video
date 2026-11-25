@@ -11,9 +11,11 @@ from backend.models.profile import AspectRatio, CustomImage, ImageDisplayMode, M
 
 
 ClipType = Literal["short_cliffhanger", "short_conclusive", "medium", "long"]
+ExecutionMode = Literal["auto", "semi_auto", "review_before_render"]
 JobStatus = Literal[
     "queued",
     "running",
+    "awaiting_topic_selection",
     "awaiting_review",
     "completed",
     "failed",
@@ -158,6 +160,9 @@ class ClipCandidate(BaseModel):
     """Selected clip progressing through EDL, storyboard, review, and render."""
 
     id: str
+    candidate_id: str = ""
+    original_title: str = ""
+    user_rescued: bool = False
     clip_type: ClipType
     aspect_ratio: AspectRatio
     score: int = Field(ge=0, le=100)
@@ -237,6 +242,7 @@ class ModelUsageRecord(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     cost_usd: float = 0.0
+    total_latency_sec: float = 0.0
 
 
 class CostMetrics(BaseModel):
@@ -260,6 +266,13 @@ class PhaseProgress(BaseModel):
     status: Literal["pending", "running", "completed", "skipped", "failed"] = "pending"
     progress_pct: float = 0.0
     detail: str = ""
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    duration_sec: Optional[float] = None
+    eta_sec: Optional[float] = None
+    substep: str = ""
+    items_done: int = 0
+    items_total: int = 0
 
 
 class JobState(BaseModel):
@@ -272,6 +285,9 @@ class JobState(BaseModel):
     audio_duration_sec: float = 0.0
     detected_language: str = "es"
     auto_mode: bool = True
+    execution_mode: ExecutionMode = "auto"
+    pause_before_render: bool = False
+    topics_confirmed: bool = False
 
     requested_shorts_cliffhanger: int = 3
     requested_shorts_conclusive: int = 3
@@ -298,6 +314,10 @@ class JobState(BaseModel):
     error_message: Optional[str] = None
 
     clips: list[ClipCandidate] = Field(default_factory=list)
+    editorial_blocks: list[dict[str, Any]] = Field(default_factory=list)
+    candidate_pool: list[ClipCandidate] = Field(default_factory=list)
+    rejected_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    live_metrics: dict[str, Any] = Field(default_factory=dict)
     output_dir: Optional[str] = None
     output_dir_override: Optional[str] = None
     save_analytics_report: bool = False

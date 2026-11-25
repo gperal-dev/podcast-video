@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -10,7 +12,7 @@ import tempfile
 import threading
 import unicodedata
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
@@ -30,18 +32,85 @@ def get_whisper_model(
     model_name: str,
     settings: Optional[Settings] = None,
 ) -> WhisperModel:
-    """Load and cache a WhisperModel using safe runtime device resolution."""
+    """Load and cache a WhisperModel using safe runtime device resolution and bounded CPU threads."""
     cfg = settings or get_settings()
     rt = resolve_whisper_runtime(cfg)
     key = (model_name, rt["resolved_device"], rt["resolved_compute_type"])
     with _MODEL_LOCK:
         if key not in _MODEL_CACHE:
-            _MODEL_CACHE[key] = WhisperModel(
-                model_name,
-                device=rt["resolved_device"],
-                compute_type=rt["resolved_compute_type"],
-            )
+            kwargs: dict[str, Any] = {
+                "device": rt["resolved_device"],
+                "compute_type": rt["resolved_compute_type"],
+            }
+            if rt["resolved_device"] == "cpu":
+                # Bound CPU threads so Whisper runs steadily without saturating or overheating the host
+                kwargs["cpu_threads"] = min(4, max(2, (os.cpu_count() or 4) // 2))
+                kwargs["num_workers"] = 1
+            _MODEL_CACHE[key] = WhisperModel(model_name, **kwargs)
         return _MODEL_CACHE[key]
+
+
+def compute_audio_draft_cache_key(
+    audio_path: Path,
+    language: Optional[str],
+    remove_silences: bool,
+    silence_threshold_db: float,
+    min_silence_sec: float,
+    settings: Optional[Settings] = None,
+) -> str:
+    """Build deterministic cache key for Pass-1 draft transcript + acoustic scan."""
+    cfg = settings or get_settings()
+    st = audio_path.stat()
+    h = hashlib.sha256()
+    h.update(
+        json.dumps(
+            {
+                "size": st.st_size,
+                "name": audio_path.name,
+                "draft_model": cfg.whisper_draft_model,
+                "lang": language or "auto",
+                "remove_silences": bool(remove_silences),
+                "silence_threshold_db": round(float(silence_threshold_db), 2),
+                "min_silence_sec": round(float(min_silence_sec), 2),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    # Sample first + middle + last 64KB to distinguish files with same size/name rapidly
+    try:
+        with audio_path.open("rb") as fh:
+            h.update(fh.read(65536))
+            if st.st_size > 131072:
+                fh.seek(st.st_size // 2)
+                h.update(fh.read(65536))
+                fh.seek(max(0, st.st_size - 65536))
+                h.update(fh.read(65536))
+    except OSError:
+        pass
+    return h.hexdigest()[:20]
+
+
+def load_cached_draft(cache_key: str, settings: Optional[Settings] = None) -> Optional[dict[str, Any]]:
+    cfg = settings or get_settings()
+    p = cfg.base_dir / "cache" / "transcripts" / f"{cache_key}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("sentences"):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def save_cached_draft(cache_key: str, payload: dict[str, Any], settings: Optional[Settings] = None) -> None:
+    cfg = settings or get_settings()
+    cdir = cfg.base_dir / "cache" / "transcripts"
+    cdir.mkdir(parents=True, exist_ok=True)
+    tmp = cdir / f"{cache_key}.json.tmp"
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(cdir / f"{cache_key}.json")
 
 
 def unload_whisper_models() -> None:
@@ -132,6 +201,10 @@ def apply_glossary_to_words(
                 trailing = trailing_m.group(1) if trailing_m else ""
 
                 rep_tokens = right_phrase.split()
+                if out and len(rep_tokens) >= 2:
+                    prev_norm = _normalize_glossary_token(out[-1].word)
+                    if prev_norm and _normalize_glossary_token(rep_tokens[0]) == prev_norm:
+                        rep_tokens = rep_tokens[1:]
                 if rep_tokens and trailing and not rep_tokens[-1].endswith(tuple(".,;:!?")):
                     rep_tokens[-1] = rep_tokens[-1] + trailing
 
@@ -428,8 +501,11 @@ def detect_pass2_hallucination(
     words: list[WordTimestamp],
     span_duration: float,
     reference_text: str = "",
+    clip_start: Optional[float] = None,
+    clip_end: Optional[float] = None,
+    reference_sentences: Optional[list[SentenceSegment]] = None,
 ) -> tuple[bool, str]:
-    """Detect Whisper Pass 2 hallucination loops, severe word drops, low-prob bursts, or bogus dead gaps."""
+    """Detect Whisper Pass 2 hallucination loops, severe word drops, low-prob bursts, or missing speech gaps."""
     dur = max(0.2, float(span_duration))
     ref_tokens = _normalize_glossary_token(reference_text).split() if reference_text else []
     ref_count = len(ref_tokens)
@@ -479,13 +555,85 @@ def detect_pass2_hallucination(
         if (low_count / len(words)) >= 0.35:
             return True, f"ráfaga de baja confianza ({low_count}/{len(words)} palabras con prob < 0.25)"
 
-    # (d) Anomalous internal dead gap when Pass 1 has continuous speech density
+    # (d) Leading, internal, or trailing dead gaps when Pass 1 has real speech in those intervals
+    def _ref_words_in_window(w_s: float, w_e: float) -> int:
+        if not reference_sentences or w_e <= w_s + 0.2:
+            return 0
+        cnt = 0
+        for rs in reference_sentences:
+            if rs.end > w_s + 0.1 and rs.start < w_e - 0.1:
+                cnt += len(rs.text.split())
+        return cnt
+
+    if clip_start is not None and (words[0].start - float(clip_start)) > 4.5:
+        lead_gap = words[0].start - float(clip_start)
+        if _ref_words_in_window(float(clip_start), words[0].start - 0.5) >= 5:
+            return True, f"hueco inicial de {lead_gap:.1f}s sin subtítulos"
+
+    if clip_end is not None and (float(clip_end) - words[-1].end) > 4.5:
+        trail_gap = float(clip_end) - words[-1].end
+        if _ref_words_in_window(words[-1].end + 0.5, float(clip_end)) >= 5:
+            return True, f"hueco final de {trail_gap:.1f}s sin subtítulos"
+
     if ref_wps >= 1.3 and len(words) >= 2:
-        max_gap = max(words[i].start - words[i - 1].end for i in range(1, len(words)))
-        if max_gap > max(6.5, dur * 0.32):
-            return True, f"hueco anómalo de {max_gap:.1f}s sin subtítulos"
+        max_gap = 0.0
+        gap_s = 0.0
+        gap_e = 0.0
+        for i in range(1, len(words)):
+            g = words[i].start - words[i - 1].end
+            if g > max_gap:
+                max_gap = g
+                gap_s = words[i - 1].end + 0.4
+                gap_e = words[i].start - 0.4
+        internal_limit = max(5.5, min(10.0, dur * 0.15))
+        if max_gap > internal_limit and _ref_words_in_window(gap_s, gap_e) >= 5:
+            return True, f"hueco interno de {max_gap:.1f}s sin subtítulos"
 
     return False, ""
+
+
+def _patch_missing_word_gaps(
+    words: list[WordTimestamp],
+    clip_start: float,
+    clip_end: float,
+    reference_sentences: list[SentenceSegment],
+    min_gap_sec: float = 4.0,
+) -> tuple[list[WordTimestamp], int]:
+    """Surgically fill any leading, internal, or trailing >=4s speech gap using Pass 1 reference sentences."""
+    if not reference_sentences:
+        return words, 0
+    if not words:
+        fb = _fallback_words_from_sentences(clip_start, clip_end, reference_sentences)
+        return fb, (1 if fb else 0)
+
+    gaps: list[tuple[float, float]] = []
+    if words[0].start - float(clip_start) >= min_gap_sec:
+        gaps.append((float(clip_start), max(float(clip_start) + 0.1, words[0].start - 0.03)))
+    for i in range(1, len(words)):
+        g_s = words[i - 1].end + 0.03
+        g_e = words[i].start - 0.03
+        if g_e - g_s >= min_gap_sec:
+            gaps.append((g_s, g_e))
+    if float(clip_end) - words[-1].end >= min_gap_sec:
+        gaps.append((min(float(clip_end) - 0.1, words[-1].end + 0.03), float(clip_end)))
+
+    if not gaps:
+        return words, 0
+
+    inserted: list[WordTimestamp] = []
+    patched = 0
+    for g_s, g_e in gaps:
+        patch_words = _fallback_words_from_sentences(g_s, g_e, reference_sentences)
+        if len(patch_words) >= 3:
+            inserted.extend(patch_words)
+            patched += 1
+
+    if not inserted:
+        return words, 0
+
+    merged = [*words, *inserted]
+    merged.sort(key=lambda w: w.start)
+    return merged, patched
 
 
 def _fallback_words_from_sentences(
@@ -537,6 +685,7 @@ def _run_whisper_pass2_attempt(
     vad_filter: bool,
     no_speech_threshold: float,
     initial_prompt: Optional[str],
+    progress_cb: Optional[Callable[[float, str], None]] = None,
 ) -> tuple[list[WordTimestamp], list[SentenceSegment]]:
     transcribe_kwargs: dict[str, object] = {
         "language": language or None,
@@ -559,6 +708,8 @@ def _run_whisper_pass2_attempt(
     words: list[WordTimestamp] = []
     sentences: list[SentenceSegment] = []
     s_idx = 1
+    span_dur = max(0.5, float(clip_end) - float(clip_start))
+    last_pct = -10.0
 
     for seg in segments_iter:
         seg_words: list[WordTimestamp] = []
@@ -599,6 +750,13 @@ def _run_whisper_pass2_attempt(
                 )
                 s_idx += 1
 
+        if progress_cb is not None:
+            abs_pos = float(seg.end) + extract_start
+            pct = min(99.0, max(1.0, ((abs_pos - clip_start) / span_dur) * 100.0))
+            if pct - last_pct >= 6.0:
+                last_pct = pct
+                progress_cb(pct, f"Pasada 2 precisión: {pct:.0f}% ({len(words)} palabras)")
+
     words.sort(key=lambda w: w.start)
     return words, sentences
 
@@ -613,6 +771,7 @@ def transcribe_clip_precision(
     work_dir: Optional[Path] = None,
     settings: Optional[Settings] = None,
     reference_sentences: Optional[list[SentenceSegment]] = None,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
 ) -> tuple[list[WordTimestamp], list[SentenceSegment]]:
     """Pass 2: Precision word-level transcription with hallucination detection, retry, and Pass 1 fallback."""
     cfg = settings or get_settings()
@@ -671,9 +830,11 @@ def transcribe_clip_precision(
         if proc.returncode != 0:
             raise RuntimeError(f"FFmpeg falló extrayendo tramo para Pasada 2: {proc.stderr.strip()}")
 
+        rt = resolve_whisper_runtime(cfg)
         model = get_whisper_model(cfg.whisper_precision_model, cfg)
+        primary_beam = 1 if rt["resolved_device"] == "cpu" else 3
 
-        # Attempt 1: Precision beam=3 with anti-hallucination parameters (and never raw glossary prompt loops)
+        # Attempt 1: Precision with anti-hallucination parameters (beam=1 on CPU for ~2.5x speed without CPU spike)
         words, sentences = _run_whisper_pass2_attempt(
             model=model,
             wav_path=tmp_wav,
@@ -681,12 +842,20 @@ def transcribe_clip_precision(
             clip_end=clip_end,
             extract_start=extract_start,
             language=language,
-            beam_size=3,
+            beam_size=primary_beam,
             vad_filter=True,
             no_speech_threshold=0.6,
             initial_prompt=initial_prompt,
+            progress_cb=progress_cb,
         )
-        bad, _ = detect_pass2_hallucination(words, span_dur, reference_text)
+        bad, _ = detect_pass2_hallucination(
+            words,
+            span_dur,
+            reference_text,
+            clip_start=clip_start,
+            clip_end=clip_end,
+            reference_sentences=overlapping_refs,
+        )
 
         # Attempt 2: Retry WITHOUT initial_prompt, relaxed VAD & beam=1 if hallucination/drop detected
         if bad:
@@ -701,8 +870,16 @@ def transcribe_clip_precision(
                 vad_filter=False,
                 no_speech_threshold=0.8,
                 initial_prompt=None,
+                progress_cb=progress_cb,
             )
-            retry_bad, _ = detect_pass2_hallucination(retry_words, span_dur, reference_text)
+            retry_bad, _ = detect_pass2_hallucination(
+                retry_words,
+                span_dur,
+                reference_text,
+                clip_start=clip_start,
+                clip_end=clip_end,
+                reference_sentences=overlapping_refs,
+            )
             if not retry_bad or len(retry_words) > len(words):
                 words, sentences = retry_words, retry_sents
                 bad = retry_bad
@@ -714,6 +891,28 @@ def transcribe_clip_precision(
                 SentenceSegment(id=f"P{i + 1:04d}", start=s.start, end=s.end, text=s.text, speaker=s.speaker)
                 for i, s in enumerate(overlapping_refs)
             ]
+
+        # Surgical final guarantee: never leave a >=4s speech gap without subtitle words
+        if overlapping_refs:
+            words, patched_gaps = _patch_missing_word_gaps(
+                words,
+                clip_start=clip_start,
+                clip_end=clip_end,
+                reference_sentences=overlapping_refs,
+                min_gap_sec=4.0,
+            )
+            if patched_gaps > 0 and words:
+                sentences = [
+                    SentenceSegment(id=f"P{i + 1:04d}", start=ps, end=pe, text=pt)
+                    for i, (ps, pe, pt) in enumerate(
+                        _split_segment_into_sentences(
+                            words[0].start,
+                            words[-1].end,
+                            " ".join(w.word for w in words),
+                            words,
+                        )
+                    )
+                ]
 
         return words, sentences
     finally:
@@ -732,6 +931,7 @@ def transcribe_spans_precision(
     work_dir: Optional[Path] = None,
     settings: Optional[Settings] = None,
     reference_sentences: Optional[list[SentenceSegment]] = None,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
 ) -> list[WordTimestamp]:
     """Run Pass 2 precision Whisper across one or more narrative spans, validating each span."""
     ordered = sorted((max(0.0, float(s)), max(float(s) + 0.1, float(e))) for s, e in spans)
@@ -746,8 +946,17 @@ def transcribe_spans_precision(
         else:
             merged.append((s, e))
 
+    total_dur = max(0.5, sum(e - s for s, e in merged))
+    done_dur = 0.0
     all_words: list[WordTimestamp] = []
     for s, e in merged:
+        span_d = max(0.2, e - s)
+
+        def _on_span_pct(p: float, m: str, base_d: float = done_dur, cur_d: float = span_d) -> None:
+            if progress_cb is not None:
+                overall = min(99.0, ((base_d + (p / 100.0) * cur_d) / total_dur) * 100.0)
+                progress_cb(overall, m)
+
         w_list, _ = transcribe_clip_precision(
             audio_path=audio_path,
             clip_start=s,
@@ -757,8 +966,10 @@ def transcribe_spans_precision(
             work_dir=work_dir,
             settings=settings,
             reference_sentences=reference_sentences,
+            progress_cb=_on_span_pct if progress_cb is not None else None,
         )
         all_words.extend(w_list)
+        done_dur += span_d
 
     all_words.sort(key=lambda w: w.start)
     # Deduplicate near-identical overlapping boundary tokens
